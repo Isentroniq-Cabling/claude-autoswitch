@@ -1,0 +1,126 @@
+# claude-autoswitch
+
+Subscription-first Claude Code on Windows: run on your Claude **Teams
+subscription** until you hit its usage limit, automatically fall over to **AWS
+Bedrock** (pay-per-token), and automatically switch back when the limit window
+resets. Everyone keeps their own seat and their own AWS credentials — this tool
+only edits the local `~/.claude/settings.json`.
+
+## How it works
+
+Claude Code picks its backend from the `env` block in `~/.claude/settings.json`
+(`CLAUDE_CODE_USE_BEDROCK=1` + AWS profile/region/model IDs = Bedrock; without
+those keys it uses your cached claude.ai login). This tool manages exactly
+those keys and nothing else.
+
+Three pieces:
+
+- **`claude-switch`** (CLI) — manual switching and status.
+- **Monitor** (Task Scheduler job, every 5 min) —
+  - in *subscription* mode, scans recent Claude Code transcripts
+    (`~/.claude/projects/**/*.jsonl`) for the API error Claude Code writes when
+    you hit your usage limit. On a hit it flips to Bedrock and records when the
+    limit window resets (parsed from the error when possible, otherwise a
+    5-hour fallback).
+  - in *bedrock* mode, flips back to subscription once that reset time passes.
+    A *manual* switch to Bedrock (no auto-return time) is never flipped back.
+- **Statusline** — shows `[SUB]` / `[BEDROCK]` for the current session, plus
+  what new sessions will use and the countdown to the auto-return.
+
+Deliberately, we switch at 100% of the subscription rather than ~95%: there is
+no supported API that exposes your subscription usage percentage, and reacting
+to the actual limit error both squeezes out the full subscription and needs no
+guesswork.
+
+## Install
+
+```powershell
+git clone <this-repo>
+cd claude-autoswitch
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+On a machine that already runs Claude Code against Bedrock, the installer
+copies your existing Bedrock env (profile, region, model IDs) from
+`settings.json` into `config.json`. On a fresh machine pass them in:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -AwsProfile my-sso-profile -Region eu-west-1
+```
+
+The installer is per-user (no admin), backs up `settings.json` into
+`%LOCALAPPDATA%\claude-autoswitch\`, and **does not change your current
+backend** — it adopts whatever you are on. To start subscription-first
+behavior:
+
+```powershell
+claude-switch sub
+```
+
+## Commands
+
+```text
+claude-switch status            current mode, timers, monitor state
+claude-switch sub               use the Teams subscription (claude.ai login)
+claude-switch bedrock           use Bedrock until told otherwise
+claude-switch bedrock -Hours 5  use Bedrock, auto-return to sub in 5 hours
+claude-switch bedrock -ResetAt "2026-07-25 18:00"
+claude-switch enable|disable    background monitor on/off
+claude-switch log               recent activity
+```
+
+## Configuration (`%LOCALAPPDATA%\claude-autoswitch\config.json`)
+
+| key | meaning |
+|---|---|
+| `bedrockEnv` | env keys written into `settings.json` in Bedrock mode and removed in subscription mode |
+| `subscriptionEnv` | optional extra env keys for subscription mode (usually empty) |
+| `subscriptionModel` / `bedrockModel` | optional per-mode value for the top-level `model` setting; `null` leaves it untouched |
+
+If your subscription plan doesn't include the model you use on Bedrock, set
+`subscriptionModel` (e.g. `"opus"`) so subscription sessions start on a model
+your plan offers.
+
+## Things to know
+
+- **Switches apply to new sessions.** Env is read at session start, so a
+  running chat keeps its backend. After a flip, start a new chat or run
+  `claude --continue` in the CLI to resume the conversation on the new backend.
+- **Detection is reactive.** After hitting the limit, the flip happens on the
+  monitor's next run (≤5 min). Until then, requests in subscription mode fail
+  with the limit message — retry after the flip.
+- **Weekly caps.** If the reset time can't be parsed and you re-hit the limit
+  right after an auto-return (typical of the weekly cap), the monitor backs
+  off to a 24 h stay on Bedrock instead of 5 h. Check `claude-switch log` if
+  the timing looks off.
+- **Error formats can change** with Claude Code releases. Detection requires
+  either the limit error's machine-readable form or a line the CLI itself
+  marked as an API error — ordinary conversation text that merely mentions
+  usage limits will not trigger a switch. If detection ever stops working,
+  look at a fresh limit error in `~/.claude/projects/...jsonl` and update the
+  patterns in `src/monitor.ps1`.
+- **Backends aren't perfectly identical.** Model lineup and rollout timing can
+  differ between claude.ai and Bedrock, and the data path differs (Bedrock
+  requests go through your AWS account; subscription requests go to
+  Anthropic). The statusline keeps which one you're on visible at all times.
+- **No secrets stored.** Bedrock auth stays with your normal AWS credential
+  chain (`aws sso login`). `config.json` holds profile names and model IDs
+  only, and lives outside the repo in `%LOCALAPPDATA%`.
+
+## Team rollout
+
+1. Put this repo somewhere reachable (internal GitHub).
+2. Each person (or Intune, as the user) runs `install.ps1` with their own AWS
+   SSO profile. Seats and AWS identities stay per-user — don't share either.
+3. Day-to-day: nothing. Work on the subscription; when a limit hits, new
+   sessions ride Bedrock until the window resets.
+
+## Uninstall
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\uninstall.ps1            # keep config/backups
+powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 -PurgeData # remove everything
+```
+
+Uninstalling leaves `settings.json` on whichever backend it is currently set
+to.

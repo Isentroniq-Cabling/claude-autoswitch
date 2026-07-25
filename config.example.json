@@ -1,0 +1,14 @@
+{
+  "bedrockEnv": {
+    "CLAUDE_CODE_USE_BEDROCK": "1",
+    "AWS_PROFILE": "your-sso-profile-name",
+    "AWS_REGION": "eu-west-1",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "eu.anthropic.claude-sonnet-5[1m]",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "eu.anthropic.claude-opus-5",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "global.anthropic.claude-fable-5[1m]"
+  },
+  "subscriptionEnv": {},
+  "subscriptionModel": null,
+  "bedrockModel": null
+}
