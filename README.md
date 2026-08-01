@@ -1,5 +1,7 @@
 # claude-autoswitch
 
+[![CI](https://github.com/Isentroniq-Cabling/claude-autoswitch/actions/workflows/ci.yml/badge.svg)](https://github.com/Isentroniq-Cabling/claude-autoswitch/actions/workflows/ci.yml)
+
 Subscription-first Claude Code on Windows: run on your Claude **Teams
 subscription** until you hit its usage limit, automatically fall over to **AWS
 Bedrock** (pay-per-token), and automatically switch back when the limit window
@@ -48,14 +50,24 @@ copies your existing Bedrock env (profile, region, model IDs) from
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -AwsProfile my-sso-profile -Region eu-west-1
 ```
 
-The installer is per-user (no admin), backs up `settings.json` into
-`%LOCALAPPDATA%\claude-autoswitch\`, and **does not change your current
-backend** — it adopts whatever you are on. To start subscription-first
-behavior:
+The installer is per-user (no admin), installs to and backs up `settings.json`
+into `~\.claude-autoswitch\`, and **does not change your current backend** — it
+adopts whatever you are on. To start subscription-first behavior:
 
 ```powershell
 claude-switch sub
 ```
+
+### Installer options
+
+| flag | effect |
+|---|---|
+| `-AwsProfile` / `-Region` | Bedrock profile and region for a fresh machine |
+| `-IntervalMinutes <n>` | how often the monitor checks (default 5) |
+| `-NoStatusline` | don't add the statusline to `settings.json` |
+| `-NoTask` | don't register the monitor task (manual switching only) |
+| `-NoPath` | leave the user PATH alone (unattended installs) |
+| `-TaskName <name>` | override the scheduled-task name |
 
 ## Commands
 
@@ -69,7 +81,7 @@ claude-switch enable|disable    background monitor on/off
 claude-switch log               recent activity
 ```
 
-## Configuration (`%LOCALAPPDATA%\claude-autoswitch\config.json`)
+## Configuration (`~\.claude-autoswitch\config.json`)
 
 | key | meaning |
 |---|---|
@@ -105,7 +117,35 @@ your plan offers.
   Anthropic). The statusline keeps which one you're on visible at all times.
 - **No secrets stored.** Bedrock auth stays with your normal AWS credential
   chain (`aws sso login`). `config.json` holds profile names and model IDs
-  only, and lives outside the repo in `%LOCALAPPDATA%`.
+  only, and lives outside the repo in `~\.claude-autoswitch\`.
+- **Don't install into `%LOCALAPPDATA%`.** Inside an MSIX/AppContainer app (a
+  Claude Code shell hosted by the Claude desktop app, for one) writes under
+  `%LOCALAPPDATA%` are silently redirected into that package's `LocalCache`.
+  The path resolves normally from inside, so an install there looks successful,
+  but Task Scheduler runs outside the container and cannot see it — the monitor
+  then never runs and the task just flashes a console window on every trigger.
+  `install.ps1` uses `~\.claude-autoswitch` and hard-fails if it detects the
+  redirection. If you're unsure what an outside process sees, check
+  `(Get-Item <path> -Force).Target` — non-empty means redirected.
+- **No console flash.** The task launches via `conhost --headless`;
+  `powershell.exe -WindowStyle Hidden` is not enough, since conhost creates the
+  window before PowerShell can hide it.
+
+## Development
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tests\lint.ps1
+powershell -ExecutionPolicy Bypass -File .\tests\smoke.ps1
+powershell -ExecutionPolicy Bypass -File .\tests\lifecycle.ps1
+```
+
+All three are sandboxed and safe to run on a machine with a live install. CI
+runs the same three on `windows-latest` under Windows PowerShell 5.1. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for conventions — in particular, why the
+tests never contain the limit-error trigger text literally.
+
+If something isn't behaving, [TROUBLESHOOTING.md](TROUBLESHOOTING.md) covers the
+known failure modes and how to diagnose each one.
 
 ## Team rollout
 
@@ -123,4 +163,10 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 -PurgeData # remove eve
 ```
 
 Uninstalling leaves `settings.json` on whichever backend it is currently set
-to.
+to. `uninstall.ps1` takes the same `-NoPath` and `-TaskName` flags as the
+installer.
+
+---
+
+Internal Isentroniq tooling — not licensed for external distribution.
+Version history in [CHANGELOG.md](CHANGELOG.md).

@@ -1,5 +1,5 @@
 # claude-autoswitch installer (per-user, no admin required).
-# - copies scripts to %LOCALAPPDATA%\claude-autoswitch\bin and puts it on PATH
+# - copies scripts to ~\.claude-autoswitch\bin and puts it on PATH
 # - seeds config.json from the Bedrock env already present in ~/.claude/settings.json
 #   (or from -AwsProfile / -Region on a fresh machine)
 # - registers a Task Scheduler job that runs monitor.ps1 every few minutes
@@ -10,14 +10,30 @@ param(
   [string]$Region,
   [int]$IntervalMinutes = 5,
   [switch]$NoStatusline,
-  [switch]$NoTask
+  [switch]$NoTask,
+  # Leave the user PATH untouched (unattended installs, and the test suite).
+  [switch]$NoPath,
+  # Overridden by the test suite so a test run can never touch the real task.
+  [string]$TaskName = 'ClaudeAutoswitch'
 )
 
 $ErrorActionPreference = 'Stop'
 
-$DataDir = Join-Path $env:LOCALAPPDATA 'claude-autoswitch'
+# Deliberately NOT %LOCALAPPDATA%. Inside an MSIX/AppContainer app (e.g. a Claude
+# Code shell hosted by the Claude desktop app) writes under %LOCALAPPDATA% are
+# silently redirected into that package's LocalCache. The path still resolves in
+# there, so the install looks fine - but Task Scheduler runs outside the container
+# and cannot see it, so the monitor never runs at all.
+$DataDir = Join-Path $env:USERPROFILE '.claude-autoswitch'
 $BinDir  = Join-Path $DataDir 'bin'
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+
+$redirected = (Get-Item $DataDir -Force).Target
+if ($redirected) {
+  throw ("$DataDir is redirected to $redirected, so the scheduled task could not reach it. " +
+         'Run install.ps1 from a normal terminal, outside any packaged/containerized app.')
+}
+
 Copy-Item -Path (Join-Path $PSScriptRoot 'src\*') -Destination $BinDir -Force
 
 # cmd shim so `claude-switch` works from any shell
@@ -100,25 +116,33 @@ if (-not $NoStatusline) {
 
 # --- scheduled task ----------------------------------------------------------
 if (-not $NoTask) {
-  $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (
-    '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f (Join-Path $BinDir 'monitor.ps1'))
+  # Launch through `conhost --headless` so no console window is ever created.
+  # A bare powershell.exe action flashes a console for ~0.5s on every run even
+  # with -WindowStyle Hidden, because conhost creates the window before
+  # PowerShell can apply the style. Running the task as S4U ("whether user is
+  # logged on or not") would also avoid it, but that needs elevation and this
+  # installer is deliberately admin-free.
+  $action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\conhost.exe') -Argument (
+    '--headless powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f (Join-Path $BinDir 'monitor.ps1'))
   $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
     -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes) `
     -RepetitionDuration (New-TimeSpan -Days 3650)
   $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
-  Register-ScheduledTask -TaskName 'ClaudeAutoswitch' -Action $action -Trigger $trigger `
+  Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Settings $taskSettings -Description 'claude-autoswitch: flips Claude Code between subscription and Bedrock' `
     -Force | Out-Null
-  Write-Host ('Scheduled task ClaudeAutoswitch registered (every {0} min).' -f $IntervalMinutes)
+  Write-Host ('Scheduled task {0} registered (every {1} min).' -f $TaskName, $IntervalMinutes)
 }
 
 # --- PATH --------------------------------------------------------------------
-$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-if ($null -eq $userPath) { $userPath = '' }
-if (($userPath -split ';') -notcontains $BinDir) {
-  [Environment]::SetEnvironmentVariable('Path', ($userPath.TrimEnd(';') + ';' + $BinDir), 'User')
-  Write-Host 'Added bin dir to user PATH (open a new terminal to pick it up).'
+if (-not $NoPath) {
+  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+  if ($null -eq $userPath) { $userPath = '' }
+  if (($userPath -split ';') -notcontains $BinDir) {
+    [Environment]::SetEnvironmentVariable('Path', ($userPath.TrimEnd(';') + ';' + $BinDir), 'User')
+    Write-Host 'Added bin dir to user PATH (open a new terminal to pick it up).'
+  }
 }
 
 Write-Host ''

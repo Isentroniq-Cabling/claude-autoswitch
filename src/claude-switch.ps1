@@ -41,14 +41,14 @@ function Show-Status {
   $resetTxt = '-'
   $resetRaw = Get-Prop $state 'resetAt'
   if ($resetRaw) {
-    $reset = Parse-IsoDate $resetRaw
+    $reset = ConvertFrom-IsoDate $resetRaw
     $mins = [int]($reset - (Get-Date)).TotalMinutes
     $resetTxt = '{0:ddd HH:mm} (in {1}h{2:d2}m)' -f $reset, [int][Math]::Floor($mins / 60), ($mins % 60)
   }
 
   $lastSwitchTxt = '-'
   $lastSwitchRaw = Get-Prop $state 'lastSwitch'
-  if ($lastSwitchRaw) { $lastSwitchTxt = (Parse-IsoDate $lastSwitchRaw).ToString('ddd HH:mm') }
+  if ($lastSwitchRaw) { $lastSwitchTxt = (ConvertFrom-IsoDate $lastSwitchRaw).ToString('ddd HH:mm') }
 
   Write-Host ''
   Write-Host ('  mode                 : {0}' -f (Get-Prop $state 'mode' '?').ToUpper())

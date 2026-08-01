@@ -27,7 +27,7 @@ $returnTxt = ''
 $resetRaw = Get-Prop $state 'resetAt'
 if ($configured -eq 'BEDROCK' -and $resetRaw) {
   try {
-    $mins = [int][Math]::Max(0, ((Parse-IsoDate $resetRaw) - (Get-Date)).TotalMinutes)
+    $mins = [int][Math]::Max(0, ((ConvertFrom-IsoDate $resetRaw) - (Get-Date)).TotalMinutes)
     $returnTxt = ' (sub in {0}h{1:d2}m)' -f [int][Math]::Floor($mins / 60), ($mins % 60)
   } catch {}
 }

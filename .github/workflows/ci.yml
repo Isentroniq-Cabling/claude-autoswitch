@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Everything runs on a Windows runner under `shell: powershell`, i.e. Windows
+# PowerShell 5.1 - the same shell Claude Code launches on Windows. Running the
+# suite under pwsh 7 instead would hide exactly the 5.1-only behavior this tool
+# depends on (no ternary/null-coalescing, ConvertFrom-Json returning
+# PSCustomObject rather than a hashtable, and so on).
+jobs:
+  lint:
+    name: Lint (PSScriptAnalyzer)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        shell: powershell
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Static analysis
+        shell: powershell
+        run: |
+          .\tests\lint.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  test:
+    name: Tests (Windows PowerShell 5.1)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show shell version
+        shell: powershell
+        run: $PSVersionTable | Format-List | Out-String | Write-Host
+
+      # Switching logic, reset-time parsing, transcript scanning, statusline.
+      - name: Behavior tests
+        shell: powershell
+        run: |
+          .\tests\smoke.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # install.ps1 / uninstall.ps1 against a sandboxed USERPROFILE, including
+      # the guard that the path baked into the scheduled task is reachable from
+      # outside the installing process.
+      - name: Installer lifecycle tests
+        shell: powershell
+        run: |
+          .\tests\lifecycle.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

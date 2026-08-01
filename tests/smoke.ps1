@@ -81,7 +81,7 @@ Assert ($s.env.AWS_PROFILE -eq 'isentroniq') 'bedrock: profile restored'
 Assert ($s.env.ANTHROPIC_DEFAULT_SONNET_MODEL -like 'eu.anthropic*') 'bedrock: model id restored'
 $st = Read-JsonFile $StatePath
 Assert ($st.mode -eq 'bedrock') 'bedrock: state mode updated'
-Assert ([Math]::Abs(((Parse-IsoDate $st.resetAt) - $reset).TotalSeconds) -lt 2) 'bedrock: resetAt stored'
+Assert ([Math]::Abs(((ConvertFrom-IsoDate $st.resetAt) - $reset).TotalSeconds) -lt 2) 'bedrock: resetAt stored'
 
 Write-Host ''
 Write-Host '-- Get-ResetFromText --'
@@ -158,7 +158,7 @@ $s = Read-JsonFile $sandboxSettings
 Assert ($st.mode -eq 'bedrock') 'monitor: flipped to bedrock on limit error'
 Assert ($s.env.CLAUDE_CODE_USE_BEDROCK -eq '1') 'monitor: settings on bedrock'
 Assert ($null -ne $st.resetAt) 'monitor: fallback auto-return set'
-$hours = ((Parse-IsoDate $st.resetAt) - (Get-Date)).TotalHours
+$hours = ((ConvertFrom-IsoDate $st.resetAt) - (Get-Date)).TotalHours
 Assert ($hours -gt 4.9 -and $hours -lt 5.1) 'monitor: fallback is ~5h'
 
 Write-Host ''
@@ -189,7 +189,7 @@ try {
 finally { $env:USERPROFILE = $oldProfile }
 $st = Read-JsonFile $StatePath
 Assert ($st.mode -eq 'bedrock') 'monitor: fresh strict error flips to bedrock'
-$mins = [Math]::Abs(((Parse-IsoDate $st.resetAt) - (Get-Date).AddHours(3)).TotalMinutes)
+$mins = [Math]::Abs(((ConvertFrom-IsoDate $st.resetAt) - (Get-Date).AddHours(3)).TotalMinutes)
 Assert ($mins -lt 2) 'monitor: auto-return taken from error epoch'
 
 # Offset regression: re-running must NOT rescan already-seen lines.

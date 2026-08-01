@@ -1,11 +1,11 @@
 # claude-autoswitch shared helpers. Dot-source this file from sibling scripts.
 # Data layout (created by install.ps1):
-#   %LOCALAPPDATA%\claude-autoswitch\bin\*.ps1   <- these scripts
-#   %LOCALAPPDATA%\claude-autoswitch\config.json <- per-machine backend config
-#   %LOCALAPPDATA%\claude-autoswitch\state.json  <- current mode + timers
-#   %LOCALAPPDATA%\claude-autoswitch\log.txt
+#   ~\.claude-autoswitch\bin\*.ps1   <- these scripts
+#   ~\.claude-autoswitch\config.json <- per-machine backend config
+#   ~\.claude-autoswitch\state.json  <- current mode + timers
+#   ~\.claude-autoswitch\log.txt
+# (deliberately not %LOCALAPPDATA% - see the note in install.ps1)
 
-$BinDir       = $PSScriptRoot
 $DataDir      = Split-Path $PSScriptRoot -Parent
 $ConfigPath   = Join-Path $DataDir 'config.json'
 $StatePath    = Join-Path $DataDir 'state.json'
@@ -22,7 +22,7 @@ function Set-Prop($Object, [string]$Name, $Value) {
   $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
 }
 
-function Parse-IsoDate([string]$Value) {
+function ConvertFrom-IsoDate([string]$Value) {
   return [datetime]::Parse($Value, [System.Globalization.CultureInfo]::InvariantCulture,
     [System.Globalization.DateTimeStyles]::RoundtripKind)
 }

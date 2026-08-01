@@ -1,0 +1,17 @@
+# claude-autoswitch keeps all runtime state outside the repo (in
+# ~\.claude-autoswitch), so there is little to ignore. These are guards against
+# accidentally committing a local copy of that state or editor/OS cruft.
+
+# Runtime state, should this ever be copied into the working tree
+config.json
+state.json
+log.txt
+settings.backup.*.json
+*.tmp
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.swp

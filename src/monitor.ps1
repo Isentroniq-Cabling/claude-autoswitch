@@ -17,7 +17,7 @@ try {
 
   if ($mode -eq 'bedrock') {
     $resetRaw = Get-Prop $state 'resetAt'
-    if ($resetRaw -and $now -ge (Parse-IsoDate $resetRaw)) {
+    if ($resetRaw -and $now -ge (ConvertFrom-IsoDate $resetRaw)) {
       Set-ClaudeBackend -Mode subscription -Reason 'auto: limit window reset'
     }
     return
@@ -25,7 +25,7 @@ try {
 
   # --- subscription mode: look for a fresh limit error in the transcripts ---
   $sinceRaw = Get-Prop $state 'lastScan'
-  if ($sinceRaw) { $since = (Parse-IsoDate $sinceRaw).AddMinutes(-1) } else { $since = $now.AddMinutes(-15) }
+  if ($sinceRaw) { $since = (ConvertFrom-IsoDate $sinceRaw).AddMinutes(-1) } else { $since = $now.AddMinutes(-15) }
 
   # Per-file byte offsets so each run only scans lines appended since the last
   # one. Without this, an old limit error earlier in a still-active transcript
@@ -92,7 +92,7 @@ try {
       # just flipped back and hit the wall again, assume a weekly cap instead.
       $flipBackRaw = Get-Prop $state 'lastFlipBackAt'
       $recentFlipBack = $false
-      if ($flipBackRaw) { $recentFlipBack = ($now - (Parse-IsoDate $flipBackRaw)).TotalMinutes -lt 30 }
+      if ($flipBackRaw) { $recentFlipBack = ($now - (ConvertFrom-IsoDate $flipBackRaw)).TotalMinutes -lt 30 }
       if ($recentFlipBack) { $hitReset = $now.AddHours(24) } else { $hitReset = $now.AddHours(5) }
       Write-Log ('no reset time parseable, assuming auto-return at ' + $hitReset.ToString('o'))
     }
