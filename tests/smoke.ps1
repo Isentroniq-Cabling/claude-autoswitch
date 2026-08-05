@@ -169,7 +169,7 @@ $st = Read-JsonFile $StatePath
 $st.mode = 'subscription'; $st.resetAt = $null
 Write-JsonFile $StatePath $st
 $epochPast = [System.DateTimeOffset]::Now.AddHours(-6).ToUnixTimeSeconds()
-$staleLine = '{"type":"x","text":"Claude AI usage ' + 'limit reached' + $pipe + $epochPast + '"}'
+$staleLine = '{"type":"assistant","isApiError' + 'Message":true,"text":"Claude AI usage ' + 'limit reached' + $pipe + $epochPast + '"}'
 $transcript2 = Join-Path $sandbox '.claude\projects\proj\session2.jsonl'
 Set-Content -Path $transcript2 -Value $staleLine -Encoding UTF8
 try {
@@ -180,7 +180,7 @@ finally { $env:USERPROFILE = $oldProfile }
 $st = Read-JsonFile $StatePath
 Assert ($st.mode -eq 'subscription') 'monitor: stale (past-epoch) error ignored'
 
-$freshLine = '{"type":"x","text":"Claude AI usage ' + 'limit reached' + $pipe + $epochFuture + '"}'
+$freshLine = '{"type":"assistant","isApiError' + 'Message":true,"text":"Claude AI usage ' + 'limit reached' + $pipe + $epochFuture + '"}'
 Add-Content -Path $transcript2 -Value $freshLine -Encoding UTF8
 try {
   $env:USERPROFILE = $sandbox
@@ -204,6 +204,53 @@ try {
 finally { $env:USERPROFILE = $oldProfile }
 $st = Read-JsonFile $StatePath
 Assert ($st.mode -eq 'subscription') 'monitor: old lines not rescanned (offsets work)'
+
+Write-Host ''
+Write-Host '-- monitor: text that only QUOTES a limit error must not trigger --'
+
+# Back to subscription, preserving offsets.
+$st = Read-JsonFile $StatePath
+$st.mode = 'subscription'; $st.resetAt = $null
+Write-JsonFile $StatePath $st
+
+# A live-looking marker: correct shape, reset time still in the future.
+$epochLive = [System.DateTimeOffset]::Now.AddHours(4).ToUnixTimeSeconds()
+$quoted = 'Claude AI usage ' + 'limit reach' + 'ed' + $pipe + $epochLive
+
+# (a) The real 2026-08-04 false positive: `claude-switch log` output captured
+#     back into a transcript as a tool result. Text matches; record is a user
+#     turn, so it must be ignored.
+$toolResult = '{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_x","type":"tool_result","content":"' + $quoted + '"}]}}'
+# (b) An ordinary assistant message discussing the marker - not an API error.
+$chatter = '{"type":"assistant","message":{"content":[{"type":"text","text":"the marker looks like ' + $quoted + '"}]}}'
+$transcript3 = Join-Path $sandbox '.claude\projects\proj\session3.jsonl'
+Set-Content -Path $transcript3 -Value @($toolResult, $chatter) -Encoding UTF8
+try {
+  $env:USERPROFILE = $sandbox
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'monitor.ps1') | Out-Null
+}
+finally { $env:USERPROFILE = $oldProfile }
+$st = Read-JsonFile $StatePath
+Assert ($st.mode -eq 'subscription') 'monitor: echoed log output does NOT trigger a switch'
+
+# (c) The genuine article: same text, but a real assistant API-error record,
+#     with the message nested in message.content[] as Claude Code writes it.
+$real = '{"type":"assistant","isApiError' + 'Message":true,"message":{"content":[{"type":"text","text":"' + $quoted + '"}]}}'
+Add-Content -Path $transcript3 -Value $real -Encoding UTF8
+try {
+  $env:USERPROFILE = $sandbox
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'monitor.ps1') | Out-Null
+}
+finally { $env:USERPROFILE = $oldProfile }
+$st = Read-JsonFile $StatePath
+Assert ($st.mode -eq 'bedrock') 'monitor: real API-error record still triggers'
+$mins = [Math]::Abs(((ConvertFrom-IsoDate $st.resetAt) - (Get-Date).AddHours(4)).TotalMinutes)
+Assert ($mins -lt 2) 'monitor: reset time read from nested message.content'
+
+Write-Host ''
+Write-Host '-- log output is written without an intact trigger --'
+$logText = Get-Content (Join-Path $sandbox 'log.txt') -Raw
+Assert ($logText -notmatch 'limit reached\|\d{10,13}') 'log never contains an intact machine-readable trigger'
 
 Write-Host ''
 if ($script:fails -eq 0) { Write-Host 'ALL TESTS PASSED' -ForegroundColor Green }

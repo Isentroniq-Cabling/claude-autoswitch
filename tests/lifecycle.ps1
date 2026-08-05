@@ -107,6 +107,7 @@ try {
     $action = $task.Actions[0]
     Assert ($action.Execute -like '*conhost.exe') 'task launches via conhost (no console flash)'
     Assert ($action.Arguments -like '*--headless*') 'task uses --headless'
+    Assert ($task.Settings.MultipleInstances -eq 'IgnoreNew') 'task never runs overlapping instances'
 
     # The MSIX regression: whatever path is baked into the task must be
     # resolvable from outside the installing process. A path that only exists

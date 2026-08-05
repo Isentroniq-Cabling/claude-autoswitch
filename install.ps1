@@ -127,8 +127,11 @@ if (-not $NoTask) {
   $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
     -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes) `
     -RepetitionDuration (New-TimeSpan -Days 3650)
+  # IgnoreNew: never run two monitors at once. -StartWhenAvailable fires every
+  # missed run when the machine wakes, which otherwise arrives as a burst of
+  # overlapping instances all writing the same state file.
   $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-    -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+    -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew
   Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Settings $taskSettings -Description 'claude-autoswitch: flips Claude Code between subscription and Bedrock' `
     -Force | Out-Null

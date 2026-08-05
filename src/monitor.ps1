@@ -10,6 +10,16 @@ $ErrorActionPreference = 'Stop'
 
 if (-not (Test-Path $ConfigPath)) { return }
 
+# Only one monitor at a time. Task Scheduler will happily start a second run
+# while the first is still going (and fires every missed run at once after the
+# machine wakes) - on 2026-08-05 four instances performed and logged the same
+# flip inside one second, and earlier overlaps died fighting over state.json.
+$mutex = New-Object System.Threading.Mutex($false, 'ClaudeAutoswitchMonitor')
+$owned = $false
+try { $owned = $mutex.WaitOne(0) }
+catch [System.Threading.AbandonedMutexException] { $owned = $true }
+if (-not $owned) { $mutex.Dispose(); return }
+
 try {
   $state = Get-State
   $now = Get-Date
@@ -53,20 +63,22 @@ try {
         finally { $fs.Close() }
 
         foreach ($line in ($chunk -split "`n")) {
-          # Strict form: the limit error that carries a unix-epoch reset time.
-          if ($line -match 'limit reached\|\d{10,13}') {
-            $reset = Get-ResetFromText $line
-            if ($null -ne $reset -and $reset -gt $now) { $hit = $line; $hitReset = $reset; break }
-            continue  # stale error from a past limit window - ignore
+          # Structural check first: only a real assistant API-error record can
+          # get past this. Text that merely quotes a limit error - a log dump
+          # pasted into a chat, these very sources, documentation - is a tool
+          # result or a plain message and is rejected.
+          $errText = Get-LimitErrorFromLine $line
+          if (-not $errText) { continue }
+
+          $reset = Get-ResetFromText $errText
+          if ($errText -match 'limit reached\|\d{10,13}') {
+            # The machine-readable form carries its own reset time; if that
+            # moment has already passed the error is from a spent window.
+            if ($null -eq $reset -or $reset -le $now) { continue }
           }
-          # Prose forms: only trust lines the CLI itself marked as API errors,
-          # so conversations merely *mentioning* usage limits never trigger.
-          if ($line -match 'usage limit' -and
-              ($line -match 'isApiErrorMessage"?\s*:\s*true' -or $line -match '"type"\s*:\s*"error"')) {
-            $hit = $line
-            $hitReset = Get-ResetFromText $line
-            break
-          }
+          $hit = $errText
+          $hitReset = $reset
+          break
         }
       }
       Set-Prop $offsets $f.FullName $len
@@ -84,7 +96,13 @@ try {
 
   if ($hit) {
     $excerpt = $hit
-    if ($excerpt.Length -gt 300) { $excerpt = $excerpt.Substring(0, 300) }
+    if ($excerpt.Length -gt 200) { $excerpt = $excerpt.Substring(0, 200) }
+    # Logged with the trigger broken up: the log is routinely printed back into
+    # a Claude Code session, and an intact copy in a transcript is exactly what
+    # caused the 2026-08-04 false positive. Belt and braces alongside the
+    # structural check in Get-LimitErrorFromLine.
+    $safeMarker = 'limit-reach' + 'ed<pipe>'
+    $excerpt = $excerpt -replace 'limit reached\|', $safeMarker
     Write-Log ('limit detected in transcript: ' + $excerpt)
 
     if ($null -eq $hitReset) {
@@ -101,4 +119,8 @@ try {
 }
 catch {
   Write-Log ('monitor error: ' + $_.Exception.Message)
+}
+finally {
+  if ($owned) { $mutex.ReleaseMutex() }
+  $mutex.Dispose()
 }

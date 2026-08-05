@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.1.1 — 2026-08-05
+
+Two live misfires found by reading the switch log on a machine that had been
+running for four days.
+
+### Fixed
+
+- **The monitor triggered on its own log output.** Detection substring-matched
+  raw transcript lines, so *any* line quoting a past limit error counted —
+  including the output of `claude-switch log`, which Claude Code records back
+  into the transcript as a tool result. On 2026-08-04 that flipped a machine to
+  Bedrock for seven hours off a diagnostic command. Detection now parses each
+  line and requires a genuine assistant record flagged as an API error; a tool
+  result is a user-role record and is rejected whatever text it carries. The
+  log also writes the marker broken up, as a second line of defence.
+  Regression tests cover the echoed-log line, ordinary chat quoting the marker,
+  and the real error nested in `message.content[]`.
+- **Overlapping monitor runs.** Task Scheduler ran several instances at once —
+  four performed and logged the same flip within one second after the machine
+  woke, and earlier overlaps died fighting over `state.json`. The task is now
+  registered `-MultipleInstances IgnoreNew` and the monitor takes a named mutex,
+  so a second run exits immediately.
+- **Writes now survive a briefly locked file.** `Write-JsonFile` uses a
+  per-process temp name and retries with backoff; on-access virus scanning was
+  aborting whole monitor runs (`state.json.tmp ... used by another process`).
+- **Transcript lines with a UTF-8 BOM are parsed correctly.** The first line of
+  a transcript carries one, which raw matching ignored but JSON parsing rejects.
+
 ## 1.1.0 — 2026-08-01
 
 Recovery release. The 1.0.0 install looked healthy but the monitor had never

@@ -118,6 +118,18 @@ script into place.
 Note that ordinary conversation text mentioning usage limits deliberately does
 **not** trigger a switch — that restriction is why the patterns are narrow.
 
+### It switched when I didn't hit any limit
+
+Detection requires the transcript line to *be* an assistant record flagged as an
+API error. Quoting a limit error — pasting a log, opening these docs, discussing
+the format in a chat — is recorded as a user-role tool result or a plain
+message, and is rejected regardless of the text.
+
+Before 1.1.1 this was not true: `claude-switch log` prints past limit errors,
+Claude Code writes that output back into the transcript, and the monitor matched
+its own printout and switched for real. If you are on an older copy, re-run
+`install.ps1`.
+
 ---
 
 ## Stuck on Bedrock, never goes back

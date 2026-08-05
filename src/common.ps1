@@ -47,10 +47,25 @@ function Read-JsonFile([string]$Path) {
 
 function Write-JsonFile([string]$Path, $Object) {
   $json = $Object | ConvertTo-Json -Depth 32
-  $tmp = $Path + '.tmp'
+  # Per-process temp name so two writers never fight over the same scratch
+  # file, plus a short retry: on-access virus scanning briefly locks a file
+  # right after it is created, which used to abort a whole monitor run.
+  $tmp = '{0}.{1}.tmp' -f $Path, $PID
   $enc = New-Object System.Text.UTF8Encoding($false)
-  [System.IO.File]::WriteAllText($tmp, $json, $enc)
-  Move-Item -Path $tmp -Destination $Path -Force
+  $lastErr = $null
+  for ($attempt = 0; $attempt -lt 5; $attempt++) {
+    try {
+      [System.IO.File]::WriteAllText($tmp, $json, $enc)
+      Move-Item -Path $tmp -Destination $Path -Force
+      return
+    }
+    catch {
+      $lastErr = $_
+      Start-Sleep -Milliseconds (100 * ($attempt + 1))
+    }
+  }
+  Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+  throw $lastErr
 }
 
 function Get-State {
@@ -97,6 +112,50 @@ function Get-ResetFromText([string]$Text) {
       if ($t -le (Get-Date)) { $t = $t.AddDays(1) }
       return $t
     }
+  }
+  return $null
+}
+
+# Decide whether one transcript line is Claude genuinely reporting that the
+# subscription limit was hit. Returns the error text, or $null.
+#
+# This MUST parse the line rather than substring-match it. A transcript records
+# everything: command output, file contents, things the user or Claude typed.
+# On 2026-08-04 a `claude-switch log` printout - which quotes an earlier limit
+# error - was written back into a transcript as a tool result, matched the old
+# raw-text patterns, and switched the machine to Bedrock for seven hours. Only
+# an assistant record flagged as an API error counts; a tool result is
+# type=user and is rejected here regardless of what text it carries.
+function Get-LimitErrorFromLine([string]$Line) {
+  if ($Line -notmatch 'limit') { return $null }   # cheap reject before parsing
+  # The first line of a transcript carries a UTF-8 BOM, and ConvertFrom-Json
+  # rejects it. Raw regex matching never noticed; parsing does.
+  $Line = $Line.Trim([char]0xFEFF, [char]0x20, [char]0x09, [char]0x0D, [char]0x0A)
+  try { $obj = $Line | ConvertFrom-Json } catch { return $null }
+  if ($null -eq $obj) { return $null }
+  if ((Get-Prop $obj 'type') -ne 'assistant') { return $null }
+  if ((Get-Prop $obj 'isApiErrorMessage') -ne $true) { return $null }
+
+  # The text sits either directly on the record or inside message.content[].
+  $texts = @()
+  $t = Get-Prop $obj 'text'
+  if ($t) { $texts += [string]$t }
+  $msg = Get-Prop $obj 'message'
+  if ($msg) {
+    $mt = Get-Prop $msg 'text'
+    if ($mt) { $texts += [string]$mt }
+    foreach ($c in @(Get-Prop $msg 'content')) {
+      if ($null -eq $c) { continue }
+      if ($c -is [string]) { $texts += $c }
+      else {
+        $ct = Get-Prop $c 'text'
+        if ($ct) { $texts += [string]$ct }
+      }
+    }
+  }
+
+  foreach ($x in $texts) {
+    if ($x -match 'limit reached\|\d{10,13}' -or $x -match 'usage limit') { return $x }
   }
   return $null
 }
