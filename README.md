@@ -26,6 +26,9 @@ Three pieces:
     5-hour fallback).
   - in *bedrock* mode, flips back to subscription once that reset time passes.
     A *manual* switch to Bedrock (no auto-return time) is never flipped back.
+  - in either mode, reconciles `settings.json` back to the recorded mode if
+    something outside the tool changed the backend (a hand edit, a restored
+    backup, an interrupted switch), keeping any pending auto-return time.
 - **Statusline** — shows `[SUB]` / `[BEDROCK]` for the current session, plus
   what new sessions will use and the countdown to the auto-return.
 
@@ -58,11 +61,19 @@ adopts whatever you are on. To start subscription-first behavior:
 claude-switch sub
 ```
 
+Then **verify the failover destination** — this makes one 1-token Bedrock call
+per configured model, so a wrong profile name, region, or model id fails here,
+in front of you, instead of at the moment you hit your limit:
+
+```powershell
+claude-switch check
+```
+
 ### Installer options
 
 | flag | effect |
 |---|---|
-| `-AwsProfile` / `-Region` | Bedrock profile and region for a fresh machine |
+| `-AwsProfile` / `-Region` | Bedrock profile and region for a fresh machine (region is detected from the environment or `~/.aws/config` if omitted) |
 | `-IntervalMinutes <n>` | how often the monitor checks (default 5) |
 | `-NoStatusline` | don't add the statusline to `settings.json` |
 | `-NoTask` | don't register the monitor task (manual switching only) |
@@ -77,6 +88,7 @@ claude-switch sub               use the Teams subscription (claude.ai login)
 claude-switch bedrock           use Bedrock until told otherwise
 claude-switch bedrock -Hours 5  use Bedrock, auto-return to sub in 5 hours
 claude-switch bedrock -ResetAt "2026-07-25 18:00"
+claude-switch check             live-test every Bedrock model in config.json
 claude-switch enable|disable    background monitor on/off
 claude-switch log               recent activity
 ```
@@ -151,8 +163,15 @@ known failure modes and how to diagnose each one.
 
 1. Put this repo somewhere reachable (internal GitHub).
 2. Each person (or Intune, as the user) runs `install.ps1` with their own AWS
-   SSO profile. Seats and AWS identities stay per-user — don't share either.
-3. Day-to-day: nothing. Work on the subscription; when a limit hits, new
+   profile — that profile name is the only value they have to supply. The model
+   ids in [config.example.json](config.example.json) are `global.` inference
+   profiles, which resolve in any region, so they are the same for everyone;
+   the region is per-machine and the installer takes it from `-Region`, the
+   environment, or that profile's entry in `~/.aws/config`. Seats and AWS
+   identities stay per-user — don't share either.
+3. `claude-switch sub`, then `claude-switch check` to prove the Bedrock side
+   answers before it's ever needed.
+4. Day-to-day: nothing. Work on the subscription; when a limit hits, new
    sessions ride Bedrock until the window resets.
 
 ## Uninstall

@@ -89,6 +89,88 @@ function Get-SettingsBackend {
   return 'subscription'
 }
 
+# Cross-check bedrockEnv for the mistakes that cannot work, without a network
+# call, so this can run on every switch. A Bedrock inference profile is
+# geography-scoped: `us.anthropic.*` resolves only in a us-* region, `eu.` only
+# in eu-*, `apac.` only in ap-*; `global.` resolves anywhere, and a bare
+# `anthropic.*` id is single-region and unverifiable from here.
+#
+# Getting this wrong answers every call with HTTP 400 "The provided model
+# identifier is invalid." On 2026-08-21 a hand edit put us.* ids in front of an
+# eu-west-1 profile: the desktop main loop authenticates against Anthropic
+# directly and kept working, so nothing looked broken, while the auto-mode
+# permission classifier - which does go through Bedrock - failed closed on
+# every tool call for three days.
+#
+# Returns objects with Severity ('fatal'|'warning') and Message; empty means
+# internally consistent. Wrap calls in @() - PowerShell unrolls an empty array
+# to $null on return.
+#
+# Severity is the difference between "this destination cannot answer at all"
+# and "it will answer, one feature degrades". Blocking a failover for the
+# second kind would strand the user on a rate-limited subscription, which is a
+# worse outcome than the fault being reported.
+function Get-BedrockEnvIssue($BedrockEnv) {
+  $problems = @()
+  function New-Problem([string]$Severity, [string]$Message) {
+    return [pscustomobject]@{ Severity = $Severity; Message = $Message }
+  }
+  $declared = [string](Get-Prop $BedrockEnv 'AWS_REGION')
+  $models = @($BedrockEnv.PSObject.Properties | Where-Object { $_.Name -like 'ANTHROPIC_DEFAULT_*_MODEL' })
+
+  # The region the ids have to match is the one that will actually apply, which
+  # is not always the one written here. A region persisted in the user
+  # environment (setx / HKCU:\Environment) is present in every process Claude
+  # Code starts and takes precedence over the env block settings.json injects,
+  # so the declared region can be completely inert.
+  #
+  # Checking the ids against the declared region alone would pass the exact
+  # config that broke this machine: config.json named us-east-1, the
+  # environment named eu-west-1, and the us.* ids 400ed against it. Internally
+  # consistent, still dead.
+  $ambient = ''
+  foreach ($v in @($env:AWS_REGION, $env:AWS_DEFAULT_REGION)) {
+    if ($v -and -not $ambient) { $ambient = [string]$v }
+  }
+  $region = $declared
+  if ($ambient) { $region = $ambient }
+
+  if (-not $region) {
+    $problems += New-Problem 'fatal' 'AWS_REGION is not set in bedrockEnv.'
+  }
+  elseif (-not $declared) {
+    $problems += New-Problem 'warning' ('AWS_REGION is not set in bedrockEnv - the backend only works because "{0}" is set in the environment, which this tool does not control.' -f $ambient)
+  }
+  elseif ($ambient -ne $declared) {
+    $problems += New-Problem 'warning' ('AWS_REGION is "{0}" in bedrockEnv but "{1}" is set in the environment and wins at runtime - model ids are checked against "{1}".' -f $declared, $ambient)
+  }
+  if ($models.Count -eq 0) { $problems += New-Problem 'fatal' 'bedrockEnv has no ANTHROPIC_DEFAULT_*_MODEL entries.' }
+
+  # Auto mode runs its permission classifier as a separate Haiku-class call, so
+  # without a Haiku id that classifier has nothing to run on and fails closed.
+  # A warning, not fatal: the main loop still works on the other ids, and a
+  # degraded auto mode beats no failover at all.
+  if ($models.Count -gt 0 -and -not (Get-Prop $BedrockEnv 'ANTHROPIC_DEFAULT_HAIKU_MODEL')) {
+    $problems += New-Problem 'warning' 'ANTHROPIC_DEFAULT_HAIKU_MODEL is not set - auto mode''s permission classifier has no model on Bedrock and will deny tool calls.'
+  }
+
+  # Fatal: a geography mismatch 400s every call made with that id, and if it is
+  # wrong for one id it is normally wrong for all of them.
+  if ($region) {
+    $geoPrefix = @{ 'us' = 'us-'; 'eu' = 'eu-'; 'apac' = 'ap-' }
+    foreach ($m in $models) {
+      $id  = [string]$m.Value
+      $geo = ([regex]::Match($id, '^(us|eu|apac|global)\.anthropic\.')).Groups[1].Value
+      if (-not $geo -or $geo -eq 'global') { continue }
+      if (-not $region.StartsWith($geoPrefix[$geo])) {
+        $problems += New-Problem 'fatal' ('{0} is "{1}" but AWS_REGION is "{2}" - a {3}. profile does not resolve in {2}.' -f
+          $m.Name, $id, $region, $geo)
+      }
+    }
+  }
+  return $problems
+}
+
 # Pull a limit-reset time out of an error/transcript line, if one is present.
 # Understands the piped-unix-epoch form and "resets at <clock time>" prose.
 # Returns $null when nothing parseable is found (caller picks a fallback).
@@ -187,6 +269,19 @@ function Set-ClaudeBackend {
     $subEnv     = Get-Prop $config 'subscriptionEnv' ([pscustomobject]@{})
 
     if ($Mode -eq 'bedrock') {
+      # Never route anyone to a destination whose own config cannot answer.
+      # Sitting out a rate-limited subscription window beats flipping onto a
+      # backend that returns 400 on every call - the second failure is silent
+      # and outlasts the limit that triggered it.
+      $problems = @(Get-BedrockEnvIssue $bedrockEnv)
+      foreach ($w in @($problems | Where-Object { $_.Severity -ne 'fatal' })) {
+        Write-Log ('warning about bedrock config: ' + $w.Message)
+      }
+      $fatal = @($problems | Where-Object { $_.Severity -eq 'fatal' } | ForEach-Object { $_.Message })
+      if ($fatal.Count -gt 0) {
+        Write-Log ('refused switch -> bedrock: ' + ($fatal -join ' | '))
+        throw ("bedrockEnv in $ConfigPath cannot work, refusing to switch:`n  - " + ($fatal -join "`n  - "))
+      }
       foreach ($p in $subEnv.PSObject.Properties) {
         if ($envBlock.PSObject.Properties[$p.Name]) { $envBlock.PSObject.Properties.Remove($p.Name) }
       }

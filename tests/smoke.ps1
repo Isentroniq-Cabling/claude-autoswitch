@@ -58,6 +58,17 @@ $sandboxSettings = Join-Path $sandbox '.claude\settings.json'
 $SettingsPath = $sandboxSettings
 $ProjectsDir  = Join-Path $sandbox '.claude\projects'
 
+# The config guard resolves the region that will actually apply at runtime, so a
+# region persisted in the real user's environment would otherwise leak into
+# these assertions - on a us-east-1 machine the sandbox's eu.* ids would read as
+# a fatal mismatch and half the guard tests would fail. Pin it to the sandbox's
+# declared region so the suite is machine-independent; child processes inherit it.
+$oldAwsRegion = $env:AWS_REGION
+$hadAwsDefault = Test-Path Env:AWS_DEFAULT_REGION
+$oldAwsDefault = $env:AWS_DEFAULT_REGION
+$env:AWS_REGION = 'eu-west-1'
+if ($hadAwsDefault) { Remove-Item Env:AWS_DEFAULT_REGION }
+
 Write-Host ''
 Write-Host '-- Set-ClaudeBackend --'
 
@@ -248,9 +259,180 @@ $mins = [Math]::Abs(((ConvertFrom-IsoDate $st.resetAt) - (Get-Date).AddHours(4))
 Assert ($mins -lt 2) 'monitor: reset time read from nested message.content'
 
 Write-Host ''
+Write-Host '-- monitor: reconciles settings.json that drifted from state --'
+
+# The 2026-08-21 outage: something outside this tool (a hand edit) left Bedrock
+# keys in settings.json while state.json still said subscription. The monitor
+# read its own state, agreed with itself, and reported healthy for three days
+# while auto mode denied every tool call.
+Set-ClaudeBackend -Mode bedrock -Reason 'test'
+$st = Read-JsonFile $StatePath
+$st.mode = 'subscription'
+Write-JsonFile $StatePath $st
+try {
+  $env:USERPROFILE = $sandbox
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'monitor.ps1') | Out-Null
+}
+finally { $env:USERPROFILE = $oldProfile }
+$s = Read-JsonFile $sandboxSettings
+Assert ($null -eq $s.env.PSObject.Properties['CLAUDE_CODE_USE_BEDROCK']) 'monitor: repaired settings that drifted to bedrock'
+Assert ((Get-Content (Join-Path $sandbox 'log.txt') -Raw) -match 'drift') 'monitor: logged the drift'
+
+# The same repair in the other direction must not eat the auto-return timer:
+# Set-ClaudeBackend nulls resetAt whenever -ResetAt is not passed.
+$futureReset = (Get-Date).AddHours(3)
+Set-ClaudeBackend -Mode bedrock -ResetAt $futureReset -Reason 'test'
+$s = Read-JsonFile $sandboxSettings
+$s.env.PSObject.Properties.Remove('CLAUDE_CODE_USE_BEDROCK')   # drift to subscription
+Write-JsonFile $sandboxSettings $s
+try {
+  $env:USERPROFILE = $sandbox
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'monitor.ps1') | Out-Null
+}
+finally { $env:USERPROFILE = $oldProfile }
+$s = Read-JsonFile $sandboxSettings
+$st = Read-JsonFile $StatePath
+Assert ($s.env.CLAUDE_CODE_USE_BEDROCK -eq '1') 'monitor: repaired settings that drifted to subscription'
+Assert ($null -ne $st.resetAt -and
+  [Math]::Abs(((ConvertFrom-IsoDate $st.resetAt) - $futureReset).TotalMinutes) -lt 2) 'monitor: drift repair kept the auto-return timer'
+
+Write-Host ''
+Write-Host '-- Set-ClaudeBackend: refuses a destination that cannot answer --'
+
+# A geography-scoped inference profile only resolves in its own region, so
+# us.* ids in front of eu-west-1 answer every call with HTTP 400. Flipping onto
+# that is worse than staying rate-limited, because the failure is silent.
+$cfgPath   = Join-Path $sandbox 'config.json'
+$cfgBackup = [System.IO.File]::ReadAllText($cfgPath)
+$cfg = Read-JsonFile $cfgPath
+$cfg.bedrockEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = 'us.anthropic.claude-sonnet-5[1m]'
+Write-JsonFile $cfgPath $cfg
+Set-ClaudeBackend -Mode subscription -Reason 'test'
+$threw = $false; $guardErr = ''
+try { Set-ClaudeBackend -Mode bedrock -Reason 'test' }
+catch { $threw = $true; $guardErr = $_.Exception.Message }
+Assert $threw 'guard: refused to switch on a region/profile mismatch'
+Assert ($guardErr -match 'does not resolve in eu-west-1') 'guard: named the mismatch'
+$s = Read-JsonFile $sandboxSettings
+Assert ($null -eq $s.env.PSObject.Properties['CLAUDE_CODE_USE_BEDROCK']) 'guard: left settings on subscription'
+Assert ((Read-JsonFile $StatePath).mode -eq 'subscription') 'guard: left state on subscription'
+[System.IO.File]::WriteAllText($cfgPath, $cfgBackup)
+
+# A warning is not a veto. This sandbox config has no Haiku id, so auto mode
+# would degrade on Bedrock - but blocking the failover for that would strand the
+# user on a subscription that has already hit its limit.
+Set-ClaudeBackend -Mode bedrock -Reason 'test'
+Assert ((Read-JsonFile $StatePath).mode -eq 'bedrock') 'guard: a warning-only config still fails over'
+Assert ((Get-Content (Join-Path $sandbox 'log.txt') -Raw) -match 'HAIKU') 'guard: logged the Haiku warning'
+
+# The 2026-08-21 shape exactly, and the one a naive check misses: a config that
+# is internally consistent - us.* ids alongside a declared us-east-1 - but whose
+# region is overridden at runtime by a value persisted in the user environment.
+# On paper it reads fine; every call still returns 400.
+$cfg = Read-JsonFile $cfgPath
+$cfg.bedrockEnv.AWS_REGION = 'us-east-1'
+$cfg.bedrockEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = 'us.anthropic.claude-sonnet-5[1m]'
+Write-JsonFile $cfgPath $cfg
+Set-ClaudeBackend -Mode subscription -Reason 'test'
+$threw = $false; $guardErr = ''
+try { Set-ClaudeBackend -Mode bedrock -Reason 'test' }
+catch { $threw = $true; $guardErr = $_.Exception.Message }
+Assert $threw 'guard: caught a self-consistent config that the environment overrides'
+Assert ($guardErr -match 'does not resolve in eu-west-1') 'guard: judged the ids against the effective region'
+[System.IO.File]::WriteAllText($cfgPath, $cfgBackup)
+
+# A global.* profile resolves in every region, so it must never be flagged
+# fatal however the regions disagree - that property is why the installer seeds
+# global ids rather than a geography it had to guess.
+$cfg = Read-JsonFile $cfgPath
+$cfg.bedrockEnv.AWS_REGION = 'us-east-1'
+$cfg.bedrockEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = 'global.anthropic.claude-sonnet-5[1m]'
+$probs = @(Get-BedrockEnvIssue $cfg.bedrockEnv)
+Assert (@($probs | Where-Object { $_.Severity -eq 'fatal' }).Count -eq 0) 'guard: a global.* id is region-agnostic, never fatal'
+Assert (@($probs | Where-Object { $_.Message -match 'wins at runtime' }).Count -eq 1) 'guard: flagged the declared region as inert'
+
+Write-Host ''
+Write-Host '-- monitor: never marks a file read that it did not read --'
+
+# The offset was advanced for every candidate file, including the ones the loop
+# skipped because an earlier file had already produced a hit. Those files were
+# recorded as read to full length without being opened, so a limit error inside
+# one of them was passed over once and then invisible for good.
+$offDir = Join-Path $sandbox '.claude\projects\offsets'
+New-Item -ItemType Directory -Force -Path $offDir | Out-Null
+$epochC  = [System.DateTimeOffset]::Now.AddHours(2).ToUnixTimeSeconds()
+$lineC   = '{"type":"assistant","isApiError' + 'Message":true,"text":"Claude AI usage ' + 'limit reached' + $pipe + $epochC + '"}'
+$fileA   = Join-Path $offDir 'a-first.jsonl'
+$fileB   = Join-Path $offDir 'b-second.jsonl'
+Set-Content -Path $fileA -Value $lineC -Encoding UTF8
+Set-Content -Path $fileB -Value $lineC -Encoding UTF8
+# Offsets are keyed by FullName. %TEMP% can be an 8.3 short path while
+# Get-ChildItem inside the monitor always yields the long form, so compare
+# resolved paths or every lookup below silently misses.
+$fileA = (Get-Item $fileA).FullName
+$fileB = (Get-Item $fileB).FullName
+$st = Read-JsonFile $StatePath
+$st.mode = 'subscription'; $st.resetAt = $null
+Write-JsonFile $StatePath $st
+try {
+  $env:USERPROFILE = $sandbox
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'monitor.ps1') | Out-Null
+}
+finally { $env:USERPROFILE = $oldProfile }
+$st = Read-JsonFile $StatePath
+Assert ($st.mode -eq 'bedrock') 'offsets: first of the two files triggered the flip'
+$unread = @(@($fileA, $fileB) | Where-Object { -not (Get-Prop $st.fileOffsets $_ 0) })
+Assert ($unread.Count -eq 1) 'offsets: the file left unscanned kept no offset'
+
+# So the error still in that file must be found on the next run.
+$st.mode = 'subscription'; $st.resetAt = $null
+Write-JsonFile $StatePath $st
+try {
+  $env:USERPROFILE = $sandbox
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'monitor.ps1') | Out-Null
+}
+finally { $env:USERPROFILE = $oldProfile }
+Assert ((Read-JsonFile $StatePath).mode -eq 'bedrock') 'offsets: the skipped file is still seen on the next run'
+
+Write-Host ''
+Write-Host '-- claude-switch check: verifies the Bedrock destination --'
+
+# A fake `aws` on PATH stands in for the real CLI - first failing (bad model /
+# no access), then succeeding - so the test stays offline and free.
+$shimDir = Join-Path $sandbox 'shim'
+New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
+$oldPath = $env:PATH
+@'
+@echo off
+echo An error occurred (ValidationException) when calling the Converse operation: The provided model identifier is invalid. 1>&2
+exit /b 254
+'@ | Set-Content -Path (Join-Path $shimDir 'aws.cmd') -Encoding ASCII
+try {
+  $env:PATH = $shimDir + ';' + $env:PATH
+  $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'claude-switch.ps1') check | Out-String
+  Assert ($LASTEXITCODE -eq 1) 'check: exits 1 when a model fails'
+  Assert ($out -match 'FAIL\s+eu\.anthropic') 'check: names the failing model id'
+  Assert ($out -match 'model identifier is invalid') 'check: surfaces the AWS error text'
+
+  @'
+@echo off
+echo {"stopReason":"end_turn"}
+exit /b 0
+'@ | Set-Content -Path (Join-Path $shimDir 'aws.cmd') -Encoding ASCII
+  $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'claude-switch.ps1') check | Out-String
+  Assert ($LASTEXITCODE -eq 0) 'check: exits 0 when all models answer'
+  Assert ($out -match 'destination verified') 'check: reports success'
+}
+finally { $env:PATH = $oldPath }
+
+Write-Host ''
 Write-Host '-- log output is written without an intact trigger --'
 $logText = Get-Content (Join-Path $sandbox 'log.txt') -Raw
 Assert ($logText -notmatch 'limit reached\|\d{10,13}') 'log never contains an intact machine-readable trigger'
+
+# Hand the shell back the region it came with.
+$env:AWS_REGION = $oldAwsRegion
+if ($hadAwsDefault) { $env:AWS_DEFAULT_REGION = $oldAwsDefault }
 
 Write-Host ''
 if ($script:fails -eq 0) { Write-Host 'ALL TESTS PASSED' -ForegroundColor Green }

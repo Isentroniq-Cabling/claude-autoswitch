@@ -50,6 +50,32 @@ $envBlock = Get-Prop $settings 'env'
 $backupPath = Join-Path $DataDir ('settings.backup.' + (Get-Date).ToString('yyyyMMdd-HHmmss') + '.json')
 if (Test-Path $SettingsPath) { Copy-Item $SettingsPath $backupPath }
 
+# Which region should a fresh config.json name? A hardcoded literal is wrong on
+# most machines, and the wrong region used to mean a backend that 400s every
+# call. Take whatever this machine already resolves to, and fall back to a
+# literal only when nothing says otherwise.
+function Get-InstallRegion([string]$Preferred, [string]$AwsProfileName) {
+  if ($Preferred) { return $Preferred }
+  # A region persisted in the user environment wins over settings.json at
+  # runtime, so if one is set it is the region that will actually apply.
+  foreach ($v in @($env:AWS_REGION, $env:AWS_DEFAULT_REGION)) {
+    if ($v) { return [string]$v }
+  }
+  $awsConfig = Join-Path $env:USERPROFILE '.aws\config'
+  if ($AwsProfileName -and (Test-Path $awsConfig)) {
+    $section = ''
+    foreach ($line in (Get-Content $awsConfig)) {
+      $t = $line.Trim()
+      $head = [regex]::Match($t, '^\[(.+)\]$')
+      if ($head.Success) { $section = $head.Groups[1].Value.Trim(); continue }
+      if ($section -ne ('profile ' + $AwsProfileName) -and $section -ne $AwsProfileName) { continue }
+      $r = [regex]::Match($t, '^region\s*=\s*(\S+)')
+      if ($r.Success) { return $r.Groups[1].Value }
+    }
+  }
+  return 'us-east-1'
+}
+
 # --- seed config.json from whatever Bedrock config is already in place ------
 $knownBedrockKeys = @(
   'CLAUDE_CODE_USE_BEDROCK', 'AWS_PROFILE', 'AWS_REGION',
@@ -68,8 +94,18 @@ if (-not (Test-Path $ConfigPath)) {
   if ($bedrockEnv.Count -eq 0) {
     $bedrockEnv['CLAUDE_CODE_USE_BEDROCK'] = '1'
     if ($AwsProfile) { $bedrockEnv['AWS_PROFILE'] = $AwsProfile } else { $bedrockEnv['AWS_PROFILE'] = 'CHANGE-ME' }
-    if ($Region)     { $bedrockEnv['AWS_REGION'] = $Region }      else { $bedrockEnv['AWS_REGION'] = 'eu-west-1' }
-    Write-Warning 'No Bedrock env found in settings.json. Edit the generated config.json (profile, region, model IDs) before switching to bedrock mode.'
+    $bedrockEnv['AWS_REGION'] = Get-InstallRegion -Preferred $Region -AwsProfileName $bedrockEnv['AWS_PROFILE']
+    # `global.` inference profiles resolve in every region, so a seeded default
+    # cannot contradict whatever region ends up applying. A us./eu./apac. id is
+    # geography-scoped and answers 400 outside its own geography - that is what
+    # took this machine's auto mode down for three days on 2026-08-21, and a
+    # default has no business being able to reintroduce it. Ids verified ACTIVE
+    # and invocable 2026-08-24; `claude-switch check` re-verifies per account.
+    $bedrockEnv['ANTHROPIC_DEFAULT_SONNET_MODEL'] = 'global.anthropic.claude-sonnet-5[1m]'
+    $bedrockEnv['ANTHROPIC_DEFAULT_OPUS_MODEL']   = 'global.anthropic.claude-opus-5'
+    $bedrockEnv['ANTHROPIC_DEFAULT_HAIKU_MODEL']  = 'global.anthropic.claude-haiku-4-5-20251001-v1:0'
+    $bedrockEnv['ANTHROPIC_DEFAULT_FABLE_MODEL']  = 'global.anthropic.claude-fable-5[1m]'
+    Write-Warning 'No Bedrock env found in settings.json. Set AWS_PROFILE in the generated config.json, then run `claude-switch check`.'
   }
   else {
     if ($AwsProfile) { $bedrockEnv['AWS_PROFILE'] = $AwsProfile }
@@ -151,3 +187,4 @@ if (-not $NoPath) {
 Write-Host ''
 Write-Host 'Installed. Try:  claude-switch status'
 Write-Host 'To start subscription-first behavior:  claude-switch sub'
+Write-Host 'To verify the Bedrock failover destination:  claude-switch check'

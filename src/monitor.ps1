@@ -25,6 +25,30 @@ try {
   $now = Get-Date
   $mode = Get-Prop $state 'mode' 'subscription'
 
+  # settings.json is what actually decides where Claude Code sends its calls;
+  # state.json is only this tool's memory of where it last put it. Anything else
+  # that writes the env block - a hand edit, a half-finished install, another
+  # tool - desyncs the two, and nothing here used to look. On 2026-08-21 a hand
+  # edit left Bedrock keys in settings.json while state said subscription; this
+  # monitor then re-read that state every five minutes for three days and
+  # reported healthy while auto mode was denying every tool call. Trust state
+  # for intent, but make the file match it.
+  $settingsMode = Get-SettingsBackend
+  if ($settingsMode -ne $mode) {
+    Write-Log ("drift: settings.json is $settingsMode but state says $mode - reasserting $mode")
+    $driftReset = Get-Prop $state 'resetAt'
+    if ($mode -eq 'bedrock' -and $driftReset) {
+      # Pass resetAt through: Set-ClaudeBackend nulls it when -ResetAt is not
+      # bound, so repairing without it would silently cancel the auto-return
+      # and strand the machine on Bedrock.
+      Set-ClaudeBackend -Mode $mode -ResetAt (ConvertFrom-IsoDate $driftReset) -Reason 'auto: drift repair'
+    }
+    else {
+      Set-ClaudeBackend -Mode $mode -Reason 'auto: drift repair'
+    }
+    $state = Get-State   # Set-ClaudeBackend rewrote it
+  }
+
   if ($mode -eq 'bedrock') {
     $resetRaw = Get-Prop $state 'resetAt'
     if ($resetRaw -and $now -ge (ConvertFrom-IsoDate $resetRaw)) {
@@ -52,7 +76,7 @@ try {
       $prev = [int64](Get-Prop $offsets $f.FullName 0)
       $len = $f.Length
       if ($len -lt $prev) { $prev = 0 }  # file replaced/truncated
-      if ($len -gt $prev -and $null -eq $hit) {
+      if ($len -gt $prev) {
         $fs = [System.IO.File]::Open($f.FullName, 'Open', 'Read', 'ReadWrite')
         try {
           [void]$fs.Seek($prev, 'Begin')
@@ -80,8 +104,19 @@ try {
           $hitReset = $reset
           break
         }
+
+        # Advance the offset only for a file this run actually read. Setting it
+        # unconditionally for every file in $files - the shape before
+        # 2026-08-24 - marked the ones after a hit as read to full length
+        # without ever opening them, so a limit error sitting in one of those
+        # was skipped once and then invisible for good: the next run starts
+        # past it.
+        Set-Prop $offsets $f.FullName $len
       }
-      Set-Prop $offsets $f.FullName $len
+
+      # One hit decides the flip. Stop, and leave every unscanned file's offset
+      # where it was so the next run still sees what is in them.
+      if ($null -ne $hit) { break }
     }
   }
 

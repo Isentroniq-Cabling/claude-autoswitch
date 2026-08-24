@@ -8,8 +8,9 @@ claude-switch log
 ```
 
 `status` shows the mode, the auto-return timer, what `settings.json` is actually
-set to, and whether the monitor task is registered. `log` shows what the monitor
-has been doing. Most problems are visible in one of those two.
+set to, whether the monitor task is registered, and whether the Bedrock config
+is even usable as a failover destination. `log` shows what the monitor has been
+doing. Most problems are visible in one of those two.
 
 ---
 
@@ -129,6 +130,79 @@ Before 1.1.1 this was not true: `claude-switch log` prints past limit errors,
 Claude Code writes that output back into the transcript, and the monitor matched
 its own printout and switched for real. If you are on an older copy, re-run
 `install.ps1`.
+
+---
+
+## After a failover, every request fails with `400 The provided model identifier is invalid`
+
+The switch worked; the destination is wrong. Bedrock model ids are **per
+region and per account**: `eu.anthropic.*` ids only exist in EU regions, your
+account needs an access grant for each model, and a newer model may simply not
+be enabled where `bedrockEnv` points. Claude Code then starts, sends every
+request to a model id Bedrock rejects, and even `/compact` fails — which can
+wedge a long session entirely.
+
+This is exactly what the first real failover hit on 2026-08-21, and why
+`claude-switch check` exists. It makes one 1-token call per model in
+`bedrockEnv` and tells you which ids your profile/region combination actually
+serves:
+
+```powershell
+claude-switch check
+```
+
+Run it once after install and after any `config.json` edit. If a model FAILs,
+fix `bedrockEnv` (region, profile, or model id) in
+`~\.claude-autoswitch\config.json` and re-run until everything is OK.
+
+**The trap: the region in `config.json` may not be the region that applies.**
+A region persisted in your user environment — `setx AWS_REGION ...`, or an entry
+under `HKCU:\Environment` — is present in every process Claude Code starts, and
+it overrides the `env` block this tool writes into `settings.json`. So a
+`bedrockEnv` that reads perfectly consistently (say `us-east-1` alongside
+`us.anthropic.*` ids) can still 400 on every call, because the ids are being
+resolved against the `eu-west-1` your environment actually supplies. That is the
+2026-08-21 outage exactly. `claude-switch status` and `claude-switch check`
+both report the override:
+
+```
+warning AWS_REGION is "us-east-1" in bedrockEnv but "eu-west-1" is set in the
+        environment and wins at runtime - model ids are checked against "eu-west-1".
+```
+
+To see what your shell really supplies: `echo $env:AWS_REGION` in a *new*
+terminal, and `[Environment]::GetEnvironmentVariable('AWS_REGION','User')` for
+the persisted value. Either make the two agree, or use `global.anthropic.*`
+model ids — a `global.` inference profile resolves in every region, so it cannot
+be wrong about geography. That is what `config.example.json` ships.
+
+---
+
+## Auto mode denies every tool call, with no reason given
+
+Symptom: in auto mode every tool call is blocked; the reason shown is empty, and
+switching to Manual/Accept-Edits mode makes the same calls work. Nothing in the
+Claude Code UI says why, and the main conversation keeps working normally.
+
+Auto mode decides each tool call with a **separate Haiku-class model call**, and
+it fails closed when that call cannot be made. With `CLAUDE_CODE_USE_BEDROCK=1`
+it goes to Bedrock like everything else — but on the desktop app the *main loop*
+authenticates against Anthropic directly, so a broken Bedrock config breaks only
+the classifier. Everything looks healthy while every tool call is denied. On
+this machine that state lasted three days (2026-08-21 → 24) and read as an
+outage on Anthropic's side.
+
+Check, in order:
+
+```powershell
+claude-switch status     # is the bedrock config line clean?
+claude-switch check      # does ANTHROPIC_DEFAULT_HAIKU_MODEL answer?
+```
+
+If the Haiku id FAILs or is missing from `bedrockEnv`, that is the cause — see
+the 400 section above, and note that the classifier needs its own working model
+id even when your chat model is fine. `claude-switch sub` restores auto mode
+immediately, since the subscription path does not depend on Bedrock at all.
 
 ---
 

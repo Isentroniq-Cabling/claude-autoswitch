@@ -1,5 +1,78 @@
 # Changelog
 
+## 1.1.2 — 2026-08-24
+
+Three days of broken auto mode, from a config nothing had ever verified.
+
+A hand edit on 2026-08-21 21:25 put `us.anthropic.*` model ids in front of a
+profile whose effective region was `eu-west-1`. A Bedrock inference profile is
+geography-scoped, so every call answered `400 The provided model identifier is
+invalid` — and nothing looked broken, because the desktop app's main loop
+authenticates against Anthropic directly and never touched Bedrock. What did go
+through Bedrock was auto mode's permission classifier, a separate Haiku-class
+call that fails closed when it cannot reach a model: from 21:54 that evening
+until this release, every tool call in auto mode was denied with an empty
+reason. The subscription/Bedrock switch itself worked correctly throughout.
+
+Nothing here is a new failure mode. Each item closes a way the tool could route
+someone to a destination it had never confirmed could answer.
+
+### Added
+
+- **`claude-switch check`** — one 1-token `converse` call per model in
+  `bedrockEnv`, so a mistyped profile, a region that lacks these models, or a
+  missing access grant fails when you run the check rather than at the moment
+  the subscription limit hits. Covered by offline smoke tests using a fake
+  `aws` shim.
+- **A static config guard, run on every switch to Bedrock.** It rejects a
+  geography mismatch (`us.*` ids against an `eu-*` region and the rest) and a
+  `bedrockEnv` with no model ids at all; `Set-ClaudeBackend` refuses to switch
+  rather than flip onto a backend that 400s every call. Crucially it judges the
+  ids against the region that will *actually* apply: a region persisted in the
+  user environment (`setx` / `HKCU:\Environment`) is present in every process
+  Claude Code starts and overrides the env block written into `settings.json`,
+  so the region named in `config.json` can be completely inert. Checking
+  self-consistency alone would have passed the exact config that caused this
+  outage. A missing Haiku id is reported as a warning, not a fatal — it breaks
+  auto mode but not the main loop, and stranding someone on a rate-limited
+  subscription is the worse outcome.
+- `claude-switch status` now has a **`bedrock config`** line, so an unusable or
+  warning-carrying failover destination is visible before it is needed instead
+  of only in the log of a switch that refused to happen.
+- `claude-switch check` runs the static pass first, before it needs the `aws`
+  CLI at all: the live call reports the symptom, the static pass names the cause.
+- Install and rollout docs include the check as a standard step.
+
+### Fixed
+
+- **The monitor now reconciles drift between `state.json` and `settings.json`.**
+  If anything outside the tool changed the backend — a hand edit, a restored
+  settings backup, a half-finished switch — the monitor took `state.json` at
+  face value and, when it said `bedrock`, returned early without ever looking at
+  `settings.json`. That is exactly the shape of the 2026-08-21 outage, and the
+  monitor ran 800-odd times through it without noticing. Reconciliation happens
+  before that early return, and preserves any pending auto-return time so a
+  repair does not cancel the flip back to subscription.
+- **The monitor stopped advancing file offsets once it had found a hit.** Byte
+  offsets were only recorded on scans that found nothing, so after a detection
+  every subsequent run re-read the same tail of every transcript that had grown
+  since — and the scan now stops at the first hit instead of reading the
+  remaining files for a decision already made.
+
+### Changed
+
+- `config.example.json` and a fresh `install.ps1` seed now use
+  **`global.anthropic.*`** model ids. A `global.` inference profile resolves in
+  every region, so a shipped default cannot contradict whichever region ends up
+  applying — the failure class above becomes structurally impossible to
+  reintroduce from a default. All four ids were verified `ACTIVE` and invocable
+  on 2026-08-24; `claude-switch check` re-verifies per account, since access
+  grants are per-account and nothing here can assume yours.
+- **`install.ps1` resolves the region instead of hardcoding one.** It prefers
+  `-Region`, then a region already set in the environment, then the `region` of
+  the named profile in `~/.aws/config`, and only falls back to `us-east-1` when
+  nothing on the machine says otherwise.
+
 ## 1.1.1 — 2026-08-05
 
 Two live misfires found by reading the switch log on a machine that had been
