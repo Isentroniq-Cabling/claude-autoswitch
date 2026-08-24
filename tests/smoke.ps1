@@ -58,11 +58,11 @@ $sandboxSettings = Join-Path $sandbox '.claude\settings.json'
 $SettingsPath = $sandboxSettings
 $ProjectsDir  = Join-Path $sandbox '.claude\projects'
 
-# The config guard resolves the region that will actually apply at runtime, so a
-# region persisted in the real user's environment would otherwise leak into
-# these assertions - on a us-east-1 machine the sandbox's eu.* ids would read as
-# a fatal mismatch and half the guard tests would fail. Pin it to the sandbox's
-# declared region so the suite is machine-independent; child processes inherit it.
+# The guard only consults the environment when an env block declares no
+# region, and that path reads the process env before the registry - so without
+# a pin, the no-declared-region assertions would read whatever region the real
+# machine (or its registry) supplies. Pin the process value so those cases
+# resolve identically everywhere; child processes (the monitor runs) inherit it.
 $oldAwsRegion = $env:AWS_REGION
 $hadAwsDefault = Test-Path Env:AWS_DEFAULT_REGION
 $oldAwsDefault = $env:AWS_DEFAULT_REGION
@@ -175,10 +175,10 @@ Assert ($hours -gt 4.9 -and $hours -lt 5.1) 'monitor: fallback is ~5h'
 Write-Host ''
 Write-Host '-- monitor: stale epoch is ignored; fresh epoch is honored --'
 
-# Back to subscription (preserving file offsets), then a STALE strict error.
-$st = Read-JsonFile $StatePath
-$st.mode = 'subscription'; $st.resetAt = $null
-Write-JsonFile $StatePath $st
+# Back to subscription the way a user would (both files, offsets preserved) -
+# a raw state.json write would leave settings on bedrock, and the monitor now
+# ADOPTS what settings says rather than repairing it.
+Set-ClaudeBackend -Mode subscription -Reason 'test'
 $epochPast = [System.DateTimeOffset]::Now.AddHours(-6).ToUnixTimeSeconds()
 $staleLine = '{"type":"assistant","isApiError' + 'Message":true,"text":"Claude AI usage ' + 'limit reached' + $pipe + $epochPast + '"}'
 $transcript2 = Join-Path $sandbox '.claude\projects\proj\session2.jsonl'
@@ -204,9 +204,7 @@ $mins = [Math]::Abs(((ConvertFrom-IsoDate $st.resetAt) - (Get-Date).AddHours(3))
 Assert ($mins -lt 2) 'monitor: auto-return taken from error epoch'
 
 # Offset regression: re-running must NOT rescan already-seen lines.
-$st = Read-JsonFile $StatePath
-$st.mode = 'subscription'; $st.resetAt = $null
-Write-JsonFile $StatePath $st
+Set-ClaudeBackend -Mode subscription -Reason 'test'
 (Get-Item $transcript2).LastWriteTime = Get-Date   # touch, no new content
 try {
   $env:USERPROFILE = $sandbox
@@ -219,10 +217,8 @@ Assert ($st.mode -eq 'subscription') 'monitor: old lines not rescanned (offsets 
 Write-Host ''
 Write-Host '-- monitor: text that only QUOTES a limit error must not trigger --'
 
-# Back to subscription, preserving offsets.
-$st = Read-JsonFile $StatePath
-$st.mode = 'subscription'; $st.resetAt = $null
-Write-JsonFile $StatePath $st
+# Back to subscription, both files.
+Set-ClaudeBackend -Mode subscription -Reason 'test'
 
 # A live-looking marker: correct shape, reset time still in the future.
 $epochLive = [System.DateTimeOffset]::Now.AddHours(4).ToUnixTimeSeconds()
@@ -259,31 +255,41 @@ $mins = [Math]::Abs(((ConvertFrom-IsoDate $st.resetAt) - (Get-Date).AddHours(4))
 Assert ($mins -lt 2) 'monitor: reset time read from nested message.content'
 
 Write-Host ''
-Write-Host '-- monitor: reconciles settings.json that drifted from state --'
+Write-Host '-- monitor: the monthly spend-limit wording triggers a failover --'
 
-# The 2026-08-21 outage: something outside this tool (a hand edit) left Bedrock
-# keys in settings.json while state.json still said subscription. The monitor
-# read its own state, agreed with itself, and reported healthy for three days
-# while auto mode denied every tool call.
-Set-ClaudeBackend -Mode bedrock -Reason 'test'
-$st = Read-JsonFile $StatePath
-$st.mode = 'subscription'
-Write-JsonFile $StatePath $st
+# 2026-08-24: fourteen of these in one evening and not one detected - the org
+# spend cap says neither 'usage limit' nor 'limit reached|<epoch>'. There is
+# no reset time to parse and no billing day to trust, so the auto-return is a
+# daily retry of the subscription.
+Set-ClaudeBackend -Mode subscription -Reason 'test'
+$spendLine = '{"type":"assistant","isApiError' + 'Message":true,"text":"You' + [char]39 + 've hit your org' + [char]39 + 's monthly spend ' + 'limit - run /usage-credits to ask your admin for a higher limit"}'
+$transcript4 = Join-Path $sandbox '.claude\projects\proj\session4.jsonl'
+Set-Content -Path $transcript4 -Value $spendLine -Encoding UTF8
 try {
   $env:USERPROFILE = $sandbox
   & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'monitor.ps1') | Out-Null
 }
 finally { $env:USERPROFILE = $oldProfile }
-$s = Read-JsonFile $sandboxSettings
-Assert ($null -eq $s.env.PSObject.Properties['CLAUDE_CODE_USE_BEDROCK']) 'monitor: repaired settings that drifted to bedrock'
-Assert ((Get-Content (Join-Path $sandbox 'log.txt') -Raw) -match 'drift') 'monitor: logged the drift'
+$st = Read-JsonFile $StatePath
+Assert ($st.mode -eq 'bedrock') 'monitor: spend-limit error flips to bedrock'
+$hrs = ((ConvertFrom-IsoDate $st.resetAt) - (Get-Date)).TotalHours
+Assert ($hrs -gt 23 -and $hrs -le 24.2) 'monitor: spend limit retries the subscription daily'
+Assert ((Get-Content (Join-Path $sandbox 'log.txt') -Raw) -match 'spend limit') 'monitor: named the spend limit in the log'
 
-# The same repair in the other direction must not eat the auto-return timer:
-# Set-ClaudeBackend nulls resetAt whenever -ResetAt is not passed.
-$futureReset = (Get-Date).AddHours(3)
-Set-ClaudeBackend -Mode bedrock -ResetAt $futureReset -Reason 'test'
+Write-Host ''
+Write-Host '-- monitor: adopts out-of-band backend changes --'
+
+# settings.json is the file Claude Code actually reads, so a hand edit to it
+# is the user exercising the same right claude-switch does. The first cut of
+# this check reasserted state.json over the file - and on 2026-08-24 it
+# reverted the user's own hand-switch to Bedrock four times in forty minutes
+# while their subscription was out of monthly credits. Drift is adopted now,
+# never fought.
+Set-ClaudeBackend -Mode subscription -Reason 'test'
 $s = Read-JsonFile $sandboxSettings
-$s.env.PSObject.Properties.Remove('CLAUDE_CODE_USE_BEDROCK')   # drift to subscription
+Set-Prop $s.env 'CLAUDE_CODE_USE_BEDROCK' '1'
+Set-Prop $s.env 'AWS_REGION' 'eu-west-1'
+Set-Prop $s.env 'ANTHROPIC_DEFAULT_SONNET_MODEL' 'eu.anthropic.claude-sonnet-5[1m]'
 Write-JsonFile $sandboxSettings $s
 try {
   $env:USERPROFILE = $sandbox
@@ -292,9 +298,43 @@ try {
 finally { $env:USERPROFILE = $oldProfile }
 $s = Read-JsonFile $sandboxSettings
 $st = Read-JsonFile $StatePath
-Assert ($s.env.CLAUDE_CODE_USE_BEDROCK -eq '1') 'monitor: repaired settings that drifted to subscription'
-Assert ($null -ne $st.resetAt -and
-  [Math]::Abs(((ConvertFrom-IsoDate $st.resetAt) - $futureReset).TotalMinutes) -lt 2) 'monitor: drift repair kept the auto-return timer'
+Assert ($s.env.CLAUDE_CODE_USE_BEDROCK -eq '1') 'monitor: adoption left the hand-edited settings alone'
+Assert ($st.mode -eq 'bedrock') 'monitor: state followed the file to bedrock'
+Assert ($null -eq $st.resetAt) 'monitor: an adopted switch is manual - no auto-return'
+Assert ((Get-Content (Join-Path $sandbox 'log.txt') -Raw) -match 'adopting bedrock') 'monitor: logged the adoption'
+
+# The other direction: a hand return to subscription while an auto-return was
+# pending must clear the timer - the user has already done the returning.
+Set-ClaudeBackend -Mode bedrock -ResetAt (Get-Date).AddHours(3) -Reason 'test'
+$s = Read-JsonFile $sandboxSettings
+$s.env.PSObject.Properties.Remove('CLAUDE_CODE_USE_BEDROCK')
+Write-JsonFile $sandboxSettings $s
+try {
+  $env:USERPROFILE = $sandbox
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'monitor.ps1') | Out-Null
+}
+finally { $env:USERPROFILE = $oldProfile }
+$st = Read-JsonFile $StatePath
+Assert ($st.mode -eq 'subscription') 'monitor: state followed the file back to subscription'
+Assert ($null -eq $st.resetAt) 'monitor: hand return cleared the pending auto-return'
+
+# A broken adopted env is a visibility problem, not grounds to override the
+# human: the adoption stands, and everything wrong with the env is logged.
+# us.* ids with no declared region resolve against the pinned eu-west-1.
+$s = Read-JsonFile $sandboxSettings
+Set-Prop $s.env 'CLAUDE_CODE_USE_BEDROCK' '1'
+Set-Prop $s.env 'ANTHROPIC_DEFAULT_SONNET_MODEL' 'us.anthropic.claude-sonnet-5[1m]'
+if ($s.env.PSObject.Properties['AWS_REGION']) { $s.env.PSObject.Properties.Remove('AWS_REGION') }
+Write-JsonFile $sandboxSettings $s
+try {
+  $env:USERPROFILE = $sandbox
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'monitor.ps1') | Out-Null
+}
+finally { $env:USERPROFILE = $oldProfile }
+$st = Read-JsonFile $StatePath
+Assert ($st.mode -eq 'bedrock') 'monitor: a broken env does not block adoption'
+Assert ((Get-Content (Join-Path $sandbox 'log.txt') -Raw) -match 'does not resolve in eu-west-1') 'monitor: adoption logged the geography mismatch in the adopted env'
+Set-ClaudeBackend -Mode subscription -Reason 'test'
 
 Write-Host ''
 Write-Host '-- Set-ClaudeBackend: refuses a destination that cannot answer --'
@@ -325,31 +365,34 @@ Set-ClaudeBackend -Mode bedrock -Reason 'test'
 Assert ((Read-JsonFile $StatePath).mode -eq 'bedrock') 'guard: a warning-only config still fails over'
 Assert ((Get-Content (Join-Path $sandbox 'log.txt') -Raw) -match 'HAIKU') 'guard: logged the Haiku warning'
 
-# The 2026-08-21 shape exactly, and the one a naive check misses: a config that
-# is internally consistent - us.* ids alongside a declared us-east-1 - but whose
-# region is overridden at runtime by a value persisted in the user environment.
-# On paper it reads fine; every call still returns 400.
+# A config that declares its region is judged against that region, full stop:
+# the declared value is written into settings.json on switch and reaches
+# Claude Code's processes ahead of the machine environment. This exact shape -
+# us.* ids, declared us-east-1, machine environment saying eu-west-1 - runs
+# fine in production; an earlier revision of the guard assumed the environment
+# won and refused it.
 $cfg = Read-JsonFile $cfgPath
 $cfg.bedrockEnv.AWS_REGION = 'us-east-1'
 $cfg.bedrockEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = 'us.anthropic.claude-sonnet-5[1m]'
-Write-JsonFile $cfgPath $cfg
-Set-ClaudeBackend -Mode subscription -Reason 'test'
-$threw = $false; $guardErr = ''
-try { Set-ClaudeBackend -Mode bedrock -Reason 'test' }
-catch { $threw = $true; $guardErr = $_.Exception.Message }
-Assert $threw 'guard: caught a self-consistent config that the environment overrides'
-Assert ($guardErr -match 'does not resolve in eu-west-1') 'guard: judged the ids against the effective region'
-[System.IO.File]::WriteAllText($cfgPath, $cfgBackup)
+$probs = @(Get-BedrockEnvIssue $cfg.bedrockEnv)
+Assert (@($probs | Where-Object { $_.Severity -eq 'fatal' }).Count -eq 0) 'guard: declared region wins over the machine environment'
+
+# No declared region at all leaves the choice to the environment - the actual
+# 2026-08-21 shape: us.* ids, no AWS_REGION, on a machine that supplies
+# eu-west-1. Fatal, and the dependence on an external value is called out.
+$cfg.bedrockEnv.PSObject.Properties.Remove('AWS_REGION')
+$probs = @(Get-BedrockEnvIssue $cfg.bedrockEnv)
+Assert (@($probs | Where-Object { $_.Severity -eq 'fatal' -and $_.Message -match 'does not resolve in eu-west-1' }).Count -ge 1) 'guard: with no declared region the ids are judged against the environment'
+Assert (@($probs | Where-Object { $_.Message -match 'comes from the machine environment' }).Count -eq 1) 'guard: flagged the missing declared region'
 
 # A global.* profile resolves in every region, so it must never be flagged
-# fatal however the regions disagree - that property is why the installer seeds
+# fatal whatever the regions say - that property is why the installer seeds
 # global ids rather than a geography it had to guess.
 $cfg = Read-JsonFile $cfgPath
 $cfg.bedrockEnv.AWS_REGION = 'us-east-1'
 $cfg.bedrockEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = 'global.anthropic.claude-sonnet-5[1m]'
 $probs = @(Get-BedrockEnvIssue $cfg.bedrockEnv)
 Assert (@($probs | Where-Object { $_.Severity -eq 'fatal' }).Count -eq 0) 'guard: a global.* id is region-agnostic, never fatal'
-Assert (@($probs | Where-Object { $_.Message -match 'wins at runtime' }).Count -eq 1) 'guard: flagged the declared region as inert'
 
 Write-Host ''
 Write-Host '-- monitor: never marks a file read that it did not read --'
@@ -371,9 +414,7 @@ Set-Content -Path $fileB -Value $lineC -Encoding UTF8
 # resolved paths or every lookup below silently misses.
 $fileA = (Get-Item $fileA).FullName
 $fileB = (Get-Item $fileB).FullName
-$st = Read-JsonFile $StatePath
-$st.mode = 'subscription'; $st.resetAt = $null
-Write-JsonFile $StatePath $st
+Set-ClaudeBackend -Mode subscription -Reason 'test'
 try {
   $env:USERPROFILE = $sandbox
   & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'monitor.ps1') | Out-Null
@@ -385,8 +426,7 @@ $unread = @(@($fileA, $fileB) | Where-Object { -not (Get-Prop $st.fileOffsets $_
 Assert ($unread.Count -eq 1) 'offsets: the file left unscanned kept no offset'
 
 # So the error still in that file must be found on the next run.
-$st.mode = 'subscription'; $st.resetAt = $null
-Write-JsonFile $StatePath $st
+Set-ClaudeBackend -Mode subscription -Reason 'test'
 try {
   $env:USERPROFILE = $sandbox
   & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'monitor.ps1') | Out-Null

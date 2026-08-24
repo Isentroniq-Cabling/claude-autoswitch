@@ -26,9 +26,11 @@ Three pieces:
     5-hour fallback).
   - in *bedrock* mode, flips back to subscription once that reset time passes.
     A *manual* switch to Bedrock (no auto-return time) is never flipped back.
-  - in either mode, reconciles `settings.json` back to the recorded mode if
-    something outside the tool changed the backend (a hand edit, a restored
-    backup, an interrupted switch), keeping any pending auto-return time.
+  - in either mode, if something outside the tool changed the backend in
+    `settings.json` (a hand edit, another tool, a restored backup), adopts it:
+    state follows the file, the change is treated as a manual switch, and
+    anything wrong with the adopted env is logged. The file sessions actually
+    read always wins.
 - **Statusline** — shows `[SUB]` / `[BEDROCK]` for the current session, plus
   what new sessions will use and the countdown to the auto-return.
 

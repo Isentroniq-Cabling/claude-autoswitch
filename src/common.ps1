@@ -118,31 +118,33 @@ function Get-BedrockEnvIssue($BedrockEnv) {
   $declared = [string](Get-Prop $BedrockEnv 'AWS_REGION')
   $models = @($BedrockEnv.PSObject.Properties | Where-Object { $_.Name -like 'ANTHROPIC_DEFAULT_*_MODEL' })
 
-  # The region the ids have to match is the one that will actually apply, which
-  # is not always the one written here. A region persisted in the user
-  # environment (setx / HKCU:\Environment) is present in every process Claude
-  # Code starts and takes precedence over the env block settings.json injects,
-  # so the declared region can be completely inert.
+  # Which region do the ids have to match? The declared one, when there is
+  # one: every bedrockEnv key is written into settings.json on switch, and a
+  # value set there reaches Claude Code's processes ahead of anything the
+  # machine environment carries - proven 2026-08-24, when a session launched
+  # under an env block declaring us-east-1 ran fine on a machine whose
+  # persisted region is eu-west-1. (An earlier revision of this check assumed
+  # the opposite precedence, and refused a config that was live-verified
+  # working because the checking shell had inherited a stale region.)
   #
-  # Checking the ids against the declared region alone would pass the exact
-  # config that broke this machine: config.json named us-east-1, the
-  # environment named eu-west-1, and the us.* ids 400ed against it. Internally
-  # consistent, still dead.
-  $ambient = ''
-  foreach ($v in @($env:AWS_REGION, $env:AWS_DEFAULT_REGION)) {
-    if ($v -and -not $ambient) { $ambient = [string]$v }
-  }
+  # Only an env block with NO region leaves the choice to the environment: the
+  # calling process first, then the region persisted in the user or machine
+  # registry, which every fresh process inherits. That gap is the 2026-08-21
+  # outage: us.* ids with no declared region met a machine that supplies
+  # eu-west-1, and every call answered 400.
   $region = $declared
-  if ($ambient) { $region = $ambient }
-
   if (-not $region) {
-    $problems += New-Problem 'fatal' 'AWS_REGION is not set in bedrockEnv.'
-  }
-  elseif (-not $declared) {
-    $problems += New-Problem 'warning' ('AWS_REGION is not set in bedrockEnv - the backend only works because "{0}" is set in the environment, which this tool does not control.' -f $ambient)
-  }
-  elseif ($ambient -ne $declared) {
-    $problems += New-Problem 'warning' ('AWS_REGION is "{0}" in bedrockEnv but "{1}" is set in the environment and wins at runtime - model ids are checked against "{1}".' -f $declared, $ambient)
+    foreach ($v in @($env:AWS_REGION, $env:AWS_DEFAULT_REGION,
+        [Environment]::GetEnvironmentVariable('AWS_REGION', 'User'),
+        [Environment]::GetEnvironmentVariable('AWS_REGION', 'Machine'))) {
+      if ($v -and -not $region) { $region = [string]$v }
+    }
+    if ($region) {
+      $problems += New-Problem 'warning' ('AWS_REGION is not set in bedrockEnv - the backend will run in "{0}", which comes from the machine environment, not from this tool.' -f $region)
+    }
+    else {
+      $problems += New-Problem 'fatal' 'AWS_REGION is not set in bedrockEnv or anywhere in the environment.'
+    }
   }
   if ($models.Count -eq 0) { $problems += New-Problem 'fatal' 'bedrockEnv has no ANTHROPIC_DEFAULT_*_MODEL entries.' }
 
@@ -237,7 +239,12 @@ function Get-LimitErrorFromLine([string]$Line) {
   }
 
   foreach ($x in $texts) {
-    if ($x -match 'limit reached\|\d{10,13}' -or $x -match 'usage limit') { return $x }
+    # 'spend limit' covers the monthly credit-cap wording first seen
+    # 2026-08-24 ("You've hit your org's monthly spend limit - run
+    # /usage-credits to ask your admin for a higher limit"), which carries
+    # neither 'usage limit' nor a machine-readable epoch. Fourteen of them in
+    # one evening produced zero failovers.
+    if ($x -match 'limit reached\|\d{10,13}' -or $x -match 'usage limit' -or $x -match 'spend limit') { return $x }
   }
   return $null
 }

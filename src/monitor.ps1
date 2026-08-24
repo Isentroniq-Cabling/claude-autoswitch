@@ -4,6 +4,8 @@
 #                    limit window resets.
 # bedrock mode:      when the remembered reset time passes, flip back to
 #                    subscription. Manual bedrock (no resetAt) is left alone.
+# either mode:       if something else changed the backend in settings.json,
+#                    adopt it - state follows the file, never the reverse.
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'common.ps1')
@@ -26,27 +28,37 @@ try {
   $mode = Get-Prop $state 'mode' 'subscription'
 
   # settings.json is what actually decides where Claude Code sends its calls;
-  # state.json is only this tool's memory of where it last put it. Anything else
-  # that writes the env block - a hand edit, a half-finished install, another
-  # tool - desyncs the two, and nothing here used to look. On 2026-08-21 a hand
-  # edit left Bedrock keys in settings.json while state said subscription; this
-  # monitor then re-read that state every five minutes for three days and
-  # reported healthy while auto mode was denying every tool call. Trust state
-  # for intent, but make the file match it.
+  # state.json is only this tool's memory of where it last put things. When the
+  # two disagree, the file was changed by something with more authority than a
+  # scheduled task - a hand edit, another tool, a restored backup - so adopt
+  # the file's answer instead of fighting it. The first cut of this check
+  # (2026-08-24, morning) reasserted state over the file; by that evening it
+  # had reverted the user's own hand-switch to Bedrock four times in forty
+  # minutes, stranding them on a subscription that was out of monthly credits.
+  # A scheduled task does not outrank the human.
+  #
+  # The 2026-08-21 outage this check exists for - Bedrock keys left in
+  # settings.json that answered 400 on every call - is handled with
+  # visibility, not reversal: adopt the backend, then run the static guard
+  # over the env block actually in the file and log everything wrong with it.
   $settingsMode = Get-SettingsBackend
   if ($settingsMode -ne $mode) {
-    Write-Log ("drift: settings.json is $settingsMode but state says $mode - reasserting $mode")
-    $driftReset = Get-Prop $state 'resetAt'
-    if ($mode -eq 'bedrock' -and $driftReset) {
-      # Pass resetAt through: Set-ClaudeBackend nulls it when -ResetAt is not
-      # bound, so repairing without it would silently cancel the auto-return
-      # and strand the machine on Bedrock.
-      Set-ClaudeBackend -Mode $mode -ResetAt (ConvertFrom-IsoDate $driftReset) -Reason 'auto: drift repair'
+    Write-Log ("drift: settings.json says $settingsMode but state says $mode - adopting $settingsMode (out-of-band change)")
+    Set-Prop $state 'mode' $settingsMode
+    # An out-of-band switch has manual semantics: no auto-return. Whoever made
+    # it decides when it ends.
+    Set-Prop $state 'resetAt' $null
+    Set-Prop $state 'lastSwitch' ($now.ToString('o'))
+    Set-Prop $state 'reason' 'adopted out-of-band change'
+    if ($settingsMode -eq 'subscription') { Set-Prop $state 'lastFlipBackAt' ($now.ToString('o')) }
+    Save-State $state
+    $mode = $settingsMode
+    if ($settingsMode -eq 'bedrock') {
+      $adoptedEnv = Get-Prop (Read-JsonFile $SettingsPath) 'env' ([pscustomobject]@{})
+      foreach ($p in @(Get-BedrockEnvIssue $adoptedEnv)) {
+        Write-Log ('adopted bedrock env, ' + $p.Severity + ': ' + $p.Message)
+      }
     }
-    else {
-      Set-ClaudeBackend -Mode $mode -Reason 'auto: drift repair'
-    }
-    $state = Get-State   # Set-ClaudeBackend rewrote it
   }
 
   if ($mode -eq 'bedrock') {
@@ -141,13 +153,22 @@ try {
     Write-Log ('limit detected in transcript: ' + $excerpt)
 
     if ($null -eq $hitReset) {
-      # No parseable reset time. Default to the 5h session window; if we only
-      # just flipped back and hit the wall again, assume a weekly cap instead.
-      $flipBackRaw = Get-Prop $state 'lastFlipBackAt'
-      $recentFlipBack = $false
-      if ($flipBackRaw) { $recentFlipBack = ($now - (ConvertFrom-IsoDate $flipBackRaw)).TotalMinutes -lt 30 }
-      if ($recentFlipBack) { $hitReset = $now.AddHours(24) } else { $hitReset = $now.AddHours(5) }
-      Write-Log ('no reset time parseable, assuming auto-return at ' + $hitReset.ToString('o'))
+      if ($hit -match 'spend limit') {
+        # A monthly spend cap (org-level or personal) resets on a billing day
+        # this tool cannot know. Retry the subscription daily: the cost of
+        # guessing wrong is one failed call a day that flips straight back here.
+        $hitReset = $now.AddHours(24)
+        Write-Log 'monthly spend limit - will retry subscription daily'
+      }
+      else {
+        # No parseable reset time. Default to the 5h session window; if we only
+        # just flipped back and hit the wall again, assume a weekly cap instead.
+        $flipBackRaw = Get-Prop $state 'lastFlipBackAt'
+        $recentFlipBack = $false
+        if ($flipBackRaw) { $recentFlipBack = ($now - (ConvertFrom-IsoDate $flipBackRaw)).TotalMinutes -lt 30 }
+        if ($recentFlipBack) { $hitReset = $now.AddHours(24) } else { $hitReset = $now.AddHours(5) }
+        Write-Log ('no reset time parseable, assuming auto-return at ' + $hitReset.ToString('o'))
+      }
     }
     Set-ClaudeBackend -Mode bedrock -ResetAt $hitReset -Reason 'auto: subscription limit reached'
   }

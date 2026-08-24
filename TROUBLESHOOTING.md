@@ -155,26 +155,28 @@ Run it once after install and after any `config.json` edit. If a model FAILs,
 fix `bedrockEnv` (region, profile, or model id) in
 `~\.claude-autoswitch\config.json` and re-run until everything is OK.
 
-**The trap: the region in `config.json` may not be the region that applies.**
-A region persisted in your user environment — `setx AWS_REGION ...`, or an entry
-under `HKCU:\Environment` — is present in every process Claude Code starts, and
-it overrides the `env` block this tool writes into `settings.json`. So a
-`bedrockEnv` that reads perfectly consistently (say `us-east-1` alongside
-`us.anthropic.*` ids) can still 400 on every call, because the ids are being
-resolved against the `eu-west-1` your environment actually supplies. That is the
-2026-08-21 outage exactly. `claude-switch status` and `claude-switch check`
-both report the override:
+**The trap: an env block that sets no `AWS_REGION` runs in whatever region the
+machine supplies.** A region set in the env block wins — a value written into
+`settings.json`'s env reaches Claude Code's processes ahead of the machine
+environment. But leave `AWS_REGION` out (easy to do in a hand edit) and the
+region comes from the shell, or from the value persisted in your user
+environment (`setx AWS_REGION ...`, i.e. `HKCU:\Environment`), which every
+fresh process inherits. That is the 2026-08-21 outage exactly:
+`us.anthropic.*` ids with no declared region, on a machine that supplies
+`eu-west-1` — every call answered 400. `claude-switch status` and
+`claude-switch check` flag the dependence:
 
 ```
-warning AWS_REGION is "us-east-1" in bedrockEnv but "eu-west-1" is set in the
-        environment and wins at runtime - model ids are checked against "eu-west-1".
+warning AWS_REGION is not set in bedrockEnv - the backend will run in
+        "eu-west-1", which comes from the machine environment, not from this tool.
 ```
 
-To see what your shell really supplies: `echo $env:AWS_REGION` in a *new*
-terminal, and `[Environment]::GetEnvironmentVariable('AWS_REGION','User')` for
-the persisted value. Either make the two agree, or use `global.anthropic.*`
-model ids — a `global.` inference profile resolves in every region, so it cannot
-be wrong about geography. That is what `config.example.json` ships.
+To see what your machine supplies: `echo $env:AWS_REGION` in a *new* terminal,
+and `[Environment]::GetEnvironmentVariable('AWS_REGION','User')` for the
+persisted value. Always declare `AWS_REGION` in `bedrockEnv`, or use
+`global.anthropic.*` model ids — a `global.` inference profile resolves in
+every region, so it cannot be wrong about geography. That is what
+`config.example.json` ships.
 
 ---
 
@@ -212,7 +214,10 @@ immediately, since the subscription path does not depend on Bedrock at all.
 
 That means `state.json` has no reset time, which the monitor treats as a
 *manual* Bedrock selection and deliberately never reverts. This is also the
-state a fresh install adopts on a machine already running Bedrock.
+state a fresh install adopts on a machine already running Bedrock — and the
+state an out-of-band switch lands in: if you (or anything else) put Bedrock
+keys into `settings.json` by hand, the monitor adopts that as a manual switch
+(look for `adopting bedrock` in `claude-switch log`).
 
 Fix: `claude-switch sub`. To use Bedrock with a deadline instead, pass one:
 `claude-switch bedrock -Hours 5`.

@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.1.3 — 2026-08-24 (evening)
+
+1.1.2 shipped two wrong assumptions, and one evening of real use surfaced
+both — this time by fighting the user instead of failing them.
+
+### Fixed
+
+- **Drift is adopted, never reverted.** 1.1.2 made the monitor reassert
+  `state.json` over `settings.json`; within hours it had reverted the user's
+  own hand-switch to Bedrock four times in forty minutes, each time landing
+  them back on a subscription that was out of monthly credits. `settings.json`
+  is the file Claude Code actually reads — a hand edit to it is the user
+  exercising the same right `claude-switch` does, and a scheduled task does
+  not outrank the human. The monitor now updates its own state to match the
+  file (an adopted switch has manual semantics: no auto-return; a hand return
+  to subscription clears any pending timer) and runs the static guard over the
+  adopted env block, logging everything wrong with it. The 2026-08-21 shape is
+  handled by that visibility, not by undoing the edit.
+- **The guard judged model ids against the wrong region.** 1.1.2 assumed a
+  region persisted in the user environment beats the declared one at runtime.
+  Production proved the opposite: a value written into the settings `env`
+  block reaches Claude Code's processes ahead of the machine environment — a
+  session declaring `us-east-1` ran fine on a machine whose persisted region
+  is `eu-west-1`, while the guard, run from a shell that had inherited a stale
+  region, refused that same live-verified config. Ids are now judged against
+  the declared `AWS_REGION` when there is one; only an env block with no
+  region falls back to the environment (process, then user registry, then
+  machine registry) — which is the actual 2026-08-21 gap: `us.*` ids with no
+  declared region on a machine that supplies `eu-west-1`.
+- **The monthly spend cap is now a recognized limit error.** Detection matched
+  `usage limit` and the epoch-carrying `limit reached|…` form; the org-level
+  "You've hit your org's monthly spend limit" wording matches neither, so
+  fourteen of them in one evening produced zero failovers. It now triggers the
+  flip, and since a spend cap resets on a billing day this tool cannot know,
+  the auto-return is a daily retry of the subscription — worst case one failed
+  call a day, which flips straight back.
+
 ## 1.1.2 — 2026-08-24
 
 Three days of broken auto mode, from a config nothing had ever verified.
