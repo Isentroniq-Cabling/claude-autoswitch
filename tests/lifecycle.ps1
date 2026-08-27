@@ -206,6 +206,36 @@ try {
   Assert ($LASTEXITCODE -eq 0) '-NoShortcuts install exit code 0'
   Assert (-not (Test-Path $SubLnk)) '-NoShortcuts skipped shortcut creation'
   $out = Invoke-Installer 'uninstall.ps1' @('-NoPath', '-PurgeData', '-TaskName', $TestTask, '-ShortcutDir', $ShortcutDir)
+
+  # --- setup.ps1 (org bootstrap) ---------------------------------------------
+  Write-Host ''
+  Write-Host '-- setup.ps1 --'
+  # A fake `aws` keeps the real ~/.aws and the network out of the test; the
+  # -NoLogin/-NoUserEnv flags keep SSO and the registry out of it.
+  $shimDir = Join-Path $Sandbox 'shim'
+  New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
+  "@echo off`r`nexit /b 0" | Set-Content -Path (Join-Path $shimDir 'aws.cmd') -Encoding ASCII
+  $oldPath = $env:PATH
+  try {
+    $env:PATH = $shimDir + ';' + $env:PATH
+    $out = Invoke-Installer 'setup.ps1' @(
+      '-SsoStartUrl', 'https://example.awsapps.com/start', '-SsoAccountId', '123456789012',
+      '-NoLogin', '-NoUserEnv', '-NoPath', '-TaskName', $TestTask, '-ShortcutDir', $ShortcutDir)
+  }
+  finally { $env:PATH = $oldPath }
+  Assert ($LASTEXITCODE -eq 0) 'setup exit code 0'
+  $config = Read-Json (Join-Path $DataDir 'config.json')
+  Assert ($config.bedrockEnv.AWS_PROFILE -eq 'isentroniq') 'setup seeded the SSO profile name'
+  Assert ($config.bedrockEnv.AWS_REGION -eq 'eu-west-1') 'setup seeded the region'
+  Assert ($config.bedrockEnv.ANTHROPIC_DEFAULT_FABLE_MODEL -like 'global.anthropic.claude-fable*') 'setup seeded the global fable id'
+  Assert ($config.bedrockEnv.ANTHROPIC_DEFAULT_SONNET_MODEL -like 'eu.anthropic.*') 'setup seeded the EU sonnet id'
+  Assert ($config.subscriptionModel -eq 'fable') 'setup set the per-mode model'
+  $settings = Read-Json $SettingsPath
+  Assert ($settings.awsAuthRefresh -eq 'aws sso login --profile isentroniq') 'setup wired awsAuthRefresh'
+  Assert ($null -eq $settings.env.PSObject.Properties['CLAUDE_CODE_USE_BEDROCK']) 'setup left the machine on subscription'
+  Assert ((Read-Json (Join-Path $DataDir 'state.json')).mode -eq 'subscription') 'setup state is subscription-first'
+  Assert (Test-Path $SubLnk) 'setup created the desktop shortcuts'
+  $out = Invoke-Installer 'uninstall.ps1' @('-NoPath', '-PurgeData', '-TaskName', $TestTask, '-ShortcutDir', $ShortcutDir)
 }
 finally {
   $env:USERPROFILE = $realProfile

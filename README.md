@@ -52,6 +52,10 @@ guesswork.
 
 ## Install
 
+Setting up a machine for the Isentroniq rollout? Use the one-command
+[setup.ps1](setup.ps1) flow under **Team rollout** below — it wraps everything
+on this page. What follows is the generic, org-agnostic install.
+
 ```powershell
 git clone <this-repo>
 cd claude-autoswitch
@@ -182,20 +186,29 @@ known failure modes and how to diagnose each one.
 
 ## Team rollout
 
-1. Put this repo somewhere reachable (internal GitHub).
-2. Each person (or Intune, as the user) runs `install.ps1` with their own AWS
-   profile — that profile name is the only value they have to supply. The model
-   ids in [config.example.json](config.example.json) are `global.` inference
-   profiles, which resolve in any region, so they are the same for everyone;
-   the region is per-machine and the installer takes it from `-Region`, the
-   environment, or that profile's entry in `~/.aws/config`. Seats and AWS
-   identities stay per-user — don't share either.
-3. `claude-switch sub`, then `claude-switch check` to prove the Bedrock side
-   answers before it's ever needed.
-4. Day-to-day: nothing. Work on the subscription; when a limit hits, new
+1. Prerequisites, once per machine: [AWS CLI v2](https://aws.amazon.com/cli/),
+   git, and Claude Code signed in to the Teams subscription.
+2. Clone and run the org bootstrap — the SSO start URL and account id come
+   from your admin (they are parameters precisely so they don't live in this
+   public repo):
+
+   ```powershell
+   git clone https://github.com/Isentroniq-Cabling/claude-autoswitch.git
+   cd claude-autoswitch
+   powershell -ExecutionPolicy Bypass -File .\setup.ps1 -SsoStartUrl <url> -SsoAccountId <id>
+   ```
+
+   [setup.ps1](setup.ps1) does the whole thing: configures the AWS SSO
+   profile, seeds `config.json` with the org model ids, runs `install.ps1`
+   (monitor, statusline, desktop shortcuts, PATH), wires `awsAuthRefresh` so
+   Claude Code refreshes the SSO login itself, starts subscription-first,
+   opens the SSO sign-in, and finishes with `claude-switch check` so a broken
+   failover destination fails here instead of at the moment a limit hits.
+   Seats and AWS identities stay per-user — don't share either.
+3. Day-to-day: nothing. Work on the subscription; when a limit hits, new
    sessions ride Bedrock until the window resets. For anyone who never opens
-   a terminal, the two desktop icons the installer creates are the whole
-   interface: click the backend you want, read the status, press Enter.
+   a terminal, the two desktop icons are the whole interface: click the
+   backend you want, read the status, press Enter.
 
 ## Uninstall
 

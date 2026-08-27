@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.2.1 — 2026-08-27 (later)
+
+### Added
+
+- **`setup.ps1` — one-command onboarding.** Clone the repo, run one command,
+  done: it configures the AWS SSO profile, seeds `config.json` with the org
+  model ids (EU inference profiles, global Fable), runs `install.ps1`
+  (monitor, statusline, desktop shortcuts, PATH), wires `awsAuthRefresh` so
+  Claude Code refreshes the SSO login itself, persists
+  `AWS_PROFILE`/`AWS_REGION` for plain CLI use, starts subscription-first,
+  opens the SSO sign-in and finishes with `claude-switch check`. Idempotent.
+  The org identifiers (SSO start URL, account id) are parameters rather than
+  code, so they stay out of the repository. Covered by lifecycle tests behind
+  a fake `aws`; supersedes the settings-editing snippet that lived on Notion
+  (which also no longer needs Node).
+
+### Notes
+
+- The repository is public as of today (history audited: no credentials, no
+  account identifiers). CI minutes are no longer billed.
+
 ## 1.2.0 — 2026-08-27
 
 ### Fixed
