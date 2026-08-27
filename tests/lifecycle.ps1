@@ -44,6 +44,11 @@ try {
   $SettingsPath = Join-Path $Sandbox '.claude\settings.json'
   $DataDir      = Join-Path $Sandbox '.claude-autoswitch'
   $BinDir       = Join-Path $DataDir 'bin'
+  # Shortcuts go to a sandbox dir - passing -ShortcutDir on every install and
+  # uninstall call below is what keeps a test run off the real Desktop.
+  $ShortcutDir  = Join-Path $Sandbox 'Desktop'
+  $SubLnk       = Join-Path $ShortcutDir 'Claude - Subscription.lnk'
+  $BedLnk       = Join-Path $ShortcutDir 'Claude - Bedrock.lnk'
 
   # A settings.json that already runs on Bedrock, plus unrelated keys the
   # installer must preserve untouched.
@@ -69,7 +74,7 @@ try {
   # --- install --------------------------------------------------------------
   Write-Host ''
   Write-Host '-- install --'
-  $out = Invoke-Installer 'install.ps1' @('-NoPath', '-TaskName', $TestTask)
+  $out = Invoke-Installer 'install.ps1' @('-NoPath', '-TaskName', $TestTask, '-ShortcutDir', $ShortcutDir)
   Assert ($LASTEXITCODE -eq 0) 'installer exit code 0'
   Assert ($out -match 'config\.json created') 'installer reported config creation'
 
@@ -97,6 +102,19 @@ try {
 
   $backups = Get-ChildItem -Path $DataDir -Filter 'settings.backup.*.json' -ErrorAction SilentlyContinue
   Assert ($backups.Count -ge 1) 'settings.json backed up'
+
+  # --- desktop shortcuts -----------------------------------------------------
+  Write-Host ''
+  Write-Host '-- desktop shortcuts --'
+  Assert (Test-Path $SubLnk) 'subscription shortcut created'
+  Assert (Test-Path $BedLnk) 'bedrock shortcut created'
+  $wsh = New-Object -ComObject WScript.Shell
+  $lnk = $wsh.CreateShortcut($SubLnk)
+  Assert ($lnk.TargetPath -like '*powershell.exe') 'shortcut launches powershell'
+  Assert ($lnk.Arguments -like ('*' + $BinDir + '*')) 'shortcut points into installed bin dir'
+  Assert ($lnk.Arguments -like '* sub -Pause*') 'subscription shortcut passes sub -Pause'
+  Assert (($wsh.CreateShortcut($BedLnk)).Arguments -like '* bedrock -Pause*') 'bedrock shortcut passes bedrock -Pause'
+  [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($wsh)
 
   # --- scheduled task ------------------------------------------------------
   Write-Host ''
@@ -127,7 +145,7 @@ try {
   Write-Host '-- second install (idempotent) --'
   $configBefore = [System.IO.File]::ReadAllText((Join-Path $DataDir 'config.json'))
   $stateBefore  = [System.IO.File]::ReadAllText((Join-Path $DataDir 'state.json'))
-  $out = Invoke-Installer 'install.ps1' @('-NoPath', '-TaskName', $TestTask)
+  $out = Invoke-Installer 'install.ps1' @('-NoPath', '-TaskName', $TestTask, '-ShortcutDir', $ShortcutDir)
   Assert ($LASTEXITCODE -eq 0) 'second install exit code 0'
   Assert ($out -match 'config\.json already exists') 'second install kept existing config'
   Assert ($out -match 'statusline is already configured') 'second install kept existing statusline'
@@ -154,20 +172,40 @@ try {
   # --- uninstall -----------------------------------------------------------
   Write-Host ''
   Write-Host '-- uninstall (keep data) --'
-  $out = Invoke-Installer 'uninstall.ps1' @('-NoPath', '-TaskName', $TestTask)
+  # Replace the subscription shortcut with a same-named one that is NOT ours;
+  # the uninstaller must judge ownership by the target, not the name.
+  $wsh = New-Object -ComObject WScript.Shell
+  $foreign = $wsh.CreateShortcut($SubLnk)
+  $foreign.TargetPath = (Join-Path $env:SystemRoot 'System32\notepad.exe')
+  $foreign.Arguments = ''
+  $foreign.Save()
+  [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($wsh)
+
+  $out = Invoke-Installer 'uninstall.ps1' @('-NoPath', '-TaskName', $TestTask, '-ShortcutDir', $ShortcutDir)
   Assert ($LASTEXITCODE -eq 0) 'uninstaller exit code 0'
   Assert ($null -eq (Get-ScheduledTask -TaskName $TestTask -ErrorAction SilentlyContinue)) 'task unregistered'
   $settings = Read-Json $SettingsPath
   Assert ($null -eq $settings.PSObject.Properties['statusLine']) 'statusline removed'
   Assert ($settings.effortLevel -eq 'xhigh') 'uninstall preserved unrelated settings'
   Assert (Test-Path $DataDir) 'data dir kept without -PurgeData'
+  Assert (-not (Test-Path $BedLnk)) 'our shortcut removed'
+  Assert (Test-Path $SubLnk) 'foreign same-named shortcut left alone'
+  Remove-Item $SubLnk -Force
 
   Write-Host ''
   Write-Host '-- uninstall -PurgeData --'
-  $out = Invoke-Installer 'uninstall.ps1' @('-NoPath', '-PurgeData', '-TaskName', $TestTask)
+  $out = Invoke-Installer 'uninstall.ps1' @('-NoPath', '-PurgeData', '-TaskName', $TestTask, '-ShortcutDir', $ShortcutDir)
   Assert ($LASTEXITCODE -eq 0) 'purge exit code 0'
   Assert (-not (Test-Path $DataDir)) 'data dir removed with -PurgeData'
   Assert (Test-Path $SettingsPath) 'settings.json left in place'
+
+  # --- install -NoShortcuts --------------------------------------------------
+  Write-Host ''
+  Write-Host '-- install -NoShortcuts --'
+  $out = Invoke-Installer 'install.ps1' @('-NoPath', '-TaskName', $TestTask, '-NoShortcuts', '-ShortcutDir', $ShortcutDir)
+  Assert ($LASTEXITCODE -eq 0) '-NoShortcuts install exit code 0'
+  Assert (-not (Test-Path $SubLnk)) '-NoShortcuts skipped shortcut creation'
+  $out = Invoke-Installer 'uninstall.ps1' @('-NoPath', '-PurgeData', '-TaskName', $TestTask, '-ShortcutDir', $ShortcutDir)
 }
 finally {
   $env:USERPROFILE = $realProfile

@@ -6,7 +6,11 @@ param(
 
   # For `bedrock`: when to automatically return to subscription.
   [string]$ResetAt,
-  [double]$Hours
+  [double]$Hours,
+
+  # Show the result and wait for Enter before exiting. The desktop shortcuts
+  # pass this so their console window stays readable instead of vanishing.
+  [switch]$Pause
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,7 +23,7 @@ function Show-Usage {
 
 claude-switch - route Claude Code to your Teams subscription or AWS Bedrock
 
-  claude-switch status            show current mode, timers and monitor state
+  claude-switch status            mode, timers, subscription usage, monitor state
   claude-switch sub               switch to SUBSCRIPTION (claude.ai login)
   claude-switch bedrock           switch to BEDROCK (stays until switched back)
   claude-switch bedrock -Hours 5  switch to BEDROCK, auto-return to sub in 5h
@@ -51,11 +55,40 @@ function Show-Status {
   $lastSwitchRaw = Get-Prop $state 'lastSwitch'
   if ($lastSwitchRaw) { $lastSwitchTxt = (ConvertFrom-IsoDate $lastSwitchRaw).ToString('ddd HH:mm') }
 
+  # Subscription utilization, as last captured from the statusline feed - the
+  # only place Claude Code exposes the real 5h/7d numbers. Passive: refreshes
+  # only while some session is rendering a statusline.
+  $usageTxt = '- (populates after a session renders its statusline)'
+  $usage = Read-JsonFile $UsagePath
+  if ($usage) {
+    $parts = @()
+    foreach ($w in @(@('5h', 'five_hour'), @('7d', 'seven_day'))) {
+      $win = Get-Prop $usage $w[1]
+      if ($null -eq $win) { continue }
+      $txt = '{0} {1}%' -f $w[0], [Math]::Round([double](Get-Prop $win 'used_percentage' 0))
+      $t = ConvertFrom-ResetStamp (Get-Prop $win 'resets_at')
+      if ($t) { $txt += (' (resets {0:ddd HH:mm})' -f $t) }
+      $parts += $txt
+    }
+    if ($parts.Count -gt 0) {
+      $usageTxt = $parts -join ' | '
+      try {
+        $age = [int]((Get-Date) - (ConvertFrom-IsoDate (Get-Prop $usage 'capturedAt'))).TotalMinutes
+        $usageTxt += ('  [as of {0}m ago]' -f $age)
+      } catch {}
+    }
+  }
+
   Write-Host ''
   Write-Host ('  mode                 : {0}' -f (Get-Prop $state 'mode' '?').ToUpper())
   Write-Host ('  settings.json backend: {0}' -f (Get-SettingsBackend).ToUpper())
   Write-Host ('  auto-return to sub   : {0}' -f $resetTxt)
   Write-Host ('  last switch          : {0} ({1})' -f $lastSwitchTxt, (Get-Prop $state 'reason' '-'))
+  Write-Host ('  subscription usage   : {0}' -f $usageTxt)
+  $ccRaw = Get-Prop $state 'lastCreditCap'
+  if ($ccRaw) {
+    Write-Host ('  last credit-cap error: {0} (usage credits, e.g. Fable 5 - informational, never switches)' -f (ConvertFrom-IsoDate $ccRaw).ToString('ddd HH:mm'))
+  }
   # Say whether the failover destination is even usable. Set-ClaudeBackend
   # refuses a fatal config, so the reason has to be visible somewhere other
   # than the failed switch - and a warning here is the only notice that auto
@@ -209,8 +242,15 @@ try {
     'help' { Show-Usage; break }
     default { Show-Status }
   }
+  if ($Pause) {
+    if ($Command -ne 'status' -and $Command -ne 'help') { Show-Status }
+    Read-Host 'Press Enter to close' | Out-Null
+  }
 }
 catch {
   Write-Host ('ERROR: ' + $_.Exception.Message) -ForegroundColor Red
+  # A refused or failed switch must stay readable in a shortcut's console
+  # window - vanishing on error is how a refusal goes unnoticed.
+  if ($Pause) { Read-Host 'Press Enter to close' | Out-Null }
   exit 1
 }

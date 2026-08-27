@@ -10,6 +10,10 @@ $DataDir      = Split-Path $PSScriptRoot -Parent
 $ConfigPath   = Join-Path $DataDir 'config.json'
 $StatePath    = Join-Path $DataDir 'state.json'
 $LogPath      = Join-Path $DataDir 'log.txt'
+# Latest five_hour/seven_day utilization, captured by statusline.ps1 from the
+# session JSON Claude Code pipes to it - the only place those numbers are
+# exposed. Passive data: only as fresh as the last statusline render.
+$UsagePath    = Join-Path $DataDir 'usage.json'
 $SettingsPath = Join-Path $env:USERPROFILE '.claude\settings.json'
 $ProjectsDir  = Join-Path $env:USERPROFILE '.claude\projects'
 
@@ -25,6 +29,25 @@ function Set-Prop($Object, [string]$Name, $Value) {
 function ConvertFrom-IsoDate([string]$Value) {
   return [datetime]::Parse($Value, [System.Globalization.CultureInfo]::InvariantCulture,
     [System.Globalization.DateTimeStyles]::RoundtripKind)
+}
+
+# resets_at as Claude Code reports it in the statusline feed. The format is
+# not documented anywhere, so accept both plausible shapes - a unix epoch
+# (seconds or milliseconds) and an ISO-8601 string - and return $null for
+# anything else rather than guess.
+function ConvertFrom-ResetStamp($Value) {
+  if ($null -eq $Value) { return $null }
+  $s = ([string]$Value).Trim()
+  if (-not $s) { return $null }
+  if ($s -match '^\d{9,13}$') {
+    $n = [int64]$s
+    if ($n -gt 100000000000) { $n = [int64]($n / 1000) }  # ms epoch -> s epoch
+    return ([System.DateTimeOffset]::FromUnixTimeSeconds($n)).LocalDateTime
+  }
+  try {
+    return [datetime]::Parse($s, [System.Globalization.CultureInfo]::InvariantCulture,
+      [System.Globalization.DateTimeStyles]::RoundtripKind)
+  } catch { return $null }
 }
 
 function Write-Log([string]$Message) {
@@ -211,7 +234,7 @@ function Get-ResetFromText([string]$Text) {
 # an assistant record flagged as an API error counts; a tool result is
 # type=user and is rejected here regardless of what text it carries.
 function Get-LimitErrorFromLine([string]$Line) {
-  if ($Line -notmatch 'limit') { return $null }   # cheap reject before parsing
+  if ($Line -notmatch 'limit|credit') { return $null }   # cheap reject before parsing
   # The first line of a transcript carries a UTF-8 BOM, and ConvertFrom-Json
   # rejects it. Raw regex matching never noticed; parsing does.
   $Line = $Line.Trim([char]0xFEFF, [char]0x20, [char]0x09, [char]0x0D, [char]0x0A)
@@ -239,14 +262,34 @@ function Get-LimitErrorFromLine([string]$Line) {
   }
 
   foreach ($x in $texts) {
-    # 'spend limit' covers the monthly credit-cap wording first seen
-    # 2026-08-24 ("You've hit your org's monthly spend limit - run
-    # /usage-credits to ask your admin for a higher limit"), which carries
-    # neither 'usage limit' nor a machine-readable epoch. Fourteen of them in
-    # one evening produced zero failovers.
-    if ($x -match 'limit reached\|\d{10,13}' -or $x -match 'usage limit' -or $x -match 'spend limit') { return $x }
+    # Two families, told apart by Get-LimitKind. Plan limits ('usage limit',
+    # the machine-readable 'limit reached|<epoch>') mean the subscription's
+    # own 5-hour/weekly windows are exhausted. Credit caps ('spend limit'
+    # first seen 2026-08-24, plus the 'usage credit'/'credit cap' variants
+    # the same Claude Code release carries) mean usage credits ran out -
+    # which on this plan is Fable 5, a model that draws credits instead of
+    # plan limits. Both families are returned so the caller can log them;
+    # only the plan family may move the backend.
+    if ($x -match 'limit reached\|\d{10,13}' -or $x -match 'usage limit' -or
+        $x -match 'spend limit' -or $x -match 'usage credit' -or $x -match 'credit cap') { return $x }
   }
   return $null
+}
+
+# Which family is a limit error from?
+#   'credits' - usage credits ran out: the org's monthly spend cap, or Fable 5
+#               exhausting the credit pool it draws from. Model-scoped in
+#               practice: the plan's other models keep answering, so switching
+#               backends over it trades a working subscription for paid
+#               Bedrock. v1.1.3 shipped exactly that false positive.
+#   'plan'    - the subscription's own rate windows, the thing this tool
+#               exists to fail over.
+# If an org routes plan overage through credits, exhausting the plan still
+# emits the plan wordings first, so treating credits as non-switching cannot
+# strand anyone.
+function Get-LimitKind([string]$Text) {
+  if ($Text -match 'spend limit' -or $Text -match 'usage credit' -or $Text -match 'credit cap') { return 'credits' }
+  return 'plan'
 }
 
 # Rewrite the managed env keys in ~/.claude/settings.json for the given mode.

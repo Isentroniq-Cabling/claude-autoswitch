@@ -127,6 +127,44 @@ Assert ($out -match '^\[SUB\] Fable 5') 'statusline: subscription session detect
 Assert ($out -match 'new sessions: BEDROCK') 'statusline: divergence from configured mode shown'
 
 Write-Host ''
+Write-Host '-- statusline: captures the utilization feed --'
+
+# Claude Code hands the statusline the real five_hour/seven_day windows
+# (used % + reset times) - the only place those numbers are exposed. The
+# statusline keeps the latest copy in usage.json for `status` and the monitor.
+$resetIso = (Get-Date).AddHours(2).ToString('o')
+$json = '{"model":{"id":"claude-fable-5","display_name":"Fable 5"},"rate_limits":{"five_hour":{"used_percentage":34,"resets_at":"' + $resetIso + '"},"seven_day":{"used_percentage":62,"resets_at":"' + $resetIso + '"}}}'
+$out = $json | & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'statusline.ps1')
+Assert ($out -match '^\[SUB\] Fable 5') 'statusline: capture does not disturb the rendered line'
+Assert (Test-Path $UsagePath) 'statusline: usage.json written'
+$u = Read-JsonFile $UsagePath
+Assert ([double](Get-Prop $u.five_hour 'used_percentage') -eq 34) 'statusline: 5h percentage captured'
+Assert ([double](Get-Prop $u.seven_day 'used_percentage') -eq 62) 'statusline: 7d percentage captured'
+Assert ($null -ne (Get-Prop $u 'capturedAt')) 'statusline: capture timestamped'
+
+# Unchanged numbers must not rewrite the file (this runs on every render).
+$stamp1 = (Get-Item $UsagePath).LastWriteTimeUtc
+Start-Sleep -Milliseconds 60
+$out = $json | & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'statusline.ps1')
+Assert ((Get-Item $UsagePath).LastWriteTimeUtc -eq $stamp1) 'statusline: unchanged data not rewritten'
+$out = $json.Replace('"used_percentage":34', '"used_percentage":41') |
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'statusline.ps1')
+Assert ([double](Get-Prop (Read-JsonFile $UsagePath).five_hour 'used_percentage') -eq 41) 'statusline: changed data rewritten'
+
+# And `status` renders the captured numbers.
+$realProfile = $env:USERPROFILE
+try {
+  $env:USERPROFILE = $sandbox
+  $statusOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'claude-switch.ps1') status | Out-String
+}
+finally { $env:USERPROFILE = $realProfile }
+Assert ($statusOut -match '5h 41%') 'status: shows the 5h window'
+Assert ($statusOut -match '7d 62%') 'status: shows the 7d window'
+Assert ($statusOut -match 'resets \w{3} \d{2}:\d{2}') 'status: shows a reset time'
+# Later monitor tests assert the no-data fallbacks; leave no usage behind.
+Remove-Item $UsagePath -Force
+
+Write-Host ''
 Write-Host '-- monitor: flip back to subscription after reset --'
 
 $st = Read-JsonFile $StatePath
@@ -255,12 +293,15 @@ $mins = [Math]::Abs(((ConvertFrom-IsoDate $st.resetAt) - (Get-Date).AddHours(4))
 Assert ($mins -lt 2) 'monitor: reset time read from nested message.content'
 
 Write-Host ''
-Write-Host '-- monitor: the monthly spend-limit wording triggers a failover --'
+Write-Host '-- monitor: a credit-cap error is logged, never acted on --'
 
-# 2026-08-24: fourteen of these in one evening and not one detected - the org
-# spend cap says neither 'usage limit' nor 'limit reached|<epoch>'. There is
-# no reset time to parse and no billing day to trust, so the auto-return is a
-# daily retry of the subscription.
+# 2026-08-24, both directions of the same mistake. The org spend cap said
+# neither plan wording, so fourteen errors in one evening produced zero
+# failovers; v1.1.3 then over-corrected by switching on it. The wording is a
+# usage-credit cap - on this plan that is Fable 5, which draws credits instead
+# of plan limits - so the other models still answer and a backend switch would
+# trade a working subscription for paid Bedrock. Logged and noted in state,
+# deliberately not acted on.
 Set-ClaudeBackend -Mode subscription -Reason 'test'
 $spendLine = '{"type":"assistant","isApiError' + 'Message":true,"text":"You' + [char]39 + 've hit your org' + [char]39 + 's monthly spend ' + 'limit - run /usage-credits to ask your admin for a higher limit"}'
 $transcript4 = Join-Path $sandbox '.claude\projects\proj\session4.jsonl'
@@ -271,10 +312,64 @@ try {
 }
 finally { $env:USERPROFILE = $oldProfile }
 $st = Read-JsonFile $StatePath
-Assert ($st.mode -eq 'bedrock') 'monitor: spend-limit error flips to bedrock'
-$hrs = ((ConvertFrom-IsoDate $st.resetAt) - (Get-Date)).TotalHours
-Assert ($hrs -gt 23 -and $hrs -le 24.2) 'monitor: spend limit retries the subscription daily'
-Assert ((Get-Content (Join-Path $sandbox 'log.txt') -Raw) -match 'spend limit') 'monitor: named the spend limit in the log'
+Assert ($st.mode -eq 'subscription') 'monitor: credit-cap error does NOT switch'
+Assert ($null -ne (Get-Prop $st 'lastCreditCap')) 'monitor: credit cap noted in state'
+Assert ((Get-Content (Join-Path $sandbox 'log.txt') -Raw) -match 'credit cap seen') 'monitor: named the credit cap in the log'
+
+# A plan-limit error arriving after (or among) credit noise must still flip -
+# the credits branch keeps scanning, it does not eat the run.
+$planAfterCredits = '{"type":"assistant","isApiError' + 'Message":true,"text":"Claude AI usage ' + 'limit reached' + $pipe + $epochFuture + '"}'
+Add-Content -Path $transcript4 -Value @($spendLine, $planAfterCredits) -Encoding UTF8
+try {
+  $env:USERPROFILE = $sandbox
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'monitor.ps1') | Out-Null
+}
+finally { $env:USERPROFILE = $oldProfile }
+Assert ((Read-JsonFile $StatePath).mode -eq 'bedrock') 'monitor: plan limit still flips through credit noise'
+
+Write-Host ''
+Write-Host '-- monitor: auto-return taken from the captured utilization --'
+
+# A prose limit error carries no reset time. Before falling back to the 5h
+# guess, the monitor consults usage.json: a weekly window at 100% knows
+# exactly when it resets, otherwise the 5h window's reset stands in.
+Set-ClaudeBackend -Mode subscription -Reason 'test'
+$weeklyReset = (Get-Date).AddDays(3)
+Write-JsonFile $UsagePath ([pscustomobject]@{
+  five_hour  = [pscustomobject]@{ used_percentage = 40; resets_at = (Get-Date).AddHours(1).ToString('o') }
+  seven_day  = [pscustomobject]@{ used_percentage = 100; resets_at = $weeklyReset.ToString('o') }
+  capturedAt = (Get-Date).ToString('o')
+})
+$proseLine = '{"type":"assistant","isApiError' + 'Message":true,"text":"You have reached your usage ' + 'limit."}'
+$transcript5 = Join-Path $sandbox '.claude\projects\proj\session5.jsonl'
+Set-Content -Path $transcript5 -Value $proseLine -Encoding UTF8
+try {
+  $env:USERPROFILE = $sandbox
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'monitor.ps1') | Out-Null
+}
+finally { $env:USERPROFILE = $oldProfile }
+$st = Read-JsonFile $StatePath
+Assert ($st.mode -eq 'bedrock') 'monitor: prose limit with usage data still flips'
+Assert ([Math]::Abs(((ConvertFrom-IsoDate $st.resetAt) - $weeklyReset).TotalMinutes) -lt 2) 'monitor: auto-return taken from the exhausted weekly window'
+
+# Weekly window healthy: the 5h window's reset is the one that applies.
+Set-ClaudeBackend -Mode subscription -Reason 'test'
+$fiveReset = (Get-Date).AddMinutes(90)
+Write-JsonFile $UsagePath ([pscustomobject]@{
+  five_hour  = [pscustomobject]@{ used_percentage = 100; resets_at = $fiveReset.ToString('o') }
+  seven_day  = [pscustomobject]@{ used_percentage = 62; resets_at = (Get-Date).AddDays(3).ToString('o') }
+  capturedAt = (Get-Date).ToString('o')
+})
+Add-Content -Path $transcript5 -Value $proseLine -Encoding UTF8
+try {
+  $env:USERPROFILE = $sandbox
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'monitor.ps1') | Out-Null
+}
+finally { $env:USERPROFILE = $oldProfile }
+$st = Read-JsonFile $StatePath
+Assert ($st.mode -eq 'bedrock') 'monitor: second prose limit flipped again'
+Assert ([Math]::Abs(((ConvertFrom-IsoDate $st.resetAt) - $fiveReset).TotalMinutes) -lt 2) 'monitor: auto-return taken from the 5h window'
+Remove-Item $UsagePath -Force
 
 Write-Host ''
 Write-Host '-- monitor: adopts out-of-band backend changes --'

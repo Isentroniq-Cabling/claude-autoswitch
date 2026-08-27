@@ -133,6 +133,49 @@ its own printout and switched for real. If you are on an older copy, re-run
 
 ---
 
+## Fable says "spend limit" / "usage credits" — and nothing switches
+
+That is deliberate. Fable 5 does not draw on your plan's 5-hour/weekly
+windows; it draws on the org's **usage credits**, which have their own
+monthly cap (Claude Code's own notice: *"Fable 5 is now using usage credits
+instead of your plan limits"*). When the credits cap, every other model on
+the plan still answers — so this is a model problem, not a backend problem.
+`/model opus` (or any plan model) fixes it in-session, for free; switching
+the machine to Bedrock would replace a working subscription with pay-per-token.
+
+The monitor logs these (`credit cap seen ... not switching` in
+`claude-switch log`) and `claude-switch status` shows when one was last seen,
+but it will never move the backend for one. Only the plan-limit wordings do
+that — and if your org routes plan overage through credits, exhausting the
+plan still produces the plan wordings first, so the failover still happens
+when it should.
+
+On 2026-08-24 this exact confusion shipped in both directions: fourteen
+credit-cap errors produced zero failovers (detection didn't know the
+wording), and the fix then treated them as subscription exhaustion (they
+aren't). 1.2.0 is the version that tells them apart.
+
+---
+
+## What is my actual subscription usage? (`claude-switch status`)
+
+There is no public API for it, but Claude Code hands the statusline the real
+numbers on every render: the five-hour and seven-day windows, used % and
+reset time. The statusline keeps the latest copy, and `claude-switch status`
+shows it:
+
+```
+subscription usage   : 5h 34% (resets 18:00) | 7d 62% (resets Mon 09:00)  [as of 12m ago]
+```
+
+Two caveats. It is **passive** — it refreshes only while some session is
+rendering a statusline, hence the age tag; and until the first render after
+install it shows `-`. The monitor also reads the reset times from this file,
+so an auto-return after a limit hit lands on the window's real reset instead
+of a 5-hour guess.
+
+---
+
 ## After a failover, every request fails with `400 The provided model identifier is invalid`
 
 The switch worked; the destination is wrong. Bedrock model ids are **per

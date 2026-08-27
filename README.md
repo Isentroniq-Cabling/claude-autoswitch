@@ -15,15 +15,23 @@ Claude Code picks its backend from the `env` block in `~/.claude/settings.json`
 those keys it uses your cached claude.ai login). This tool manages exactly
 those keys and nothing else.
 
-Three pieces:
+Four pieces:
 
-- **`claude-switch`** (CLI) — manual switching and status.
+- **`claude-switch`** (CLI) — manual switching and status, including your real
+  subscription usage (5-hour and weekly windows, used % and reset times).
+- **Desktop shortcuts** — "Claude - Subscription" and "Claude - Bedrock", the
+  same switch packaged for a double-click: a console opens, switches, shows
+  the resulting status, and waits for Enter. Two explicit icons rather than a
+  toggle, so what a click does never depends on state. This is the
+  deterministic path; the monitor below is best-effort by nature.
 - **Monitor** (Task Scheduler job, every 5 min) —
   - in *subscription* mode, scans recent Claude Code transcripts
     (`~/.claude/projects/**/*.jsonl`) for the API error Claude Code writes when
-    you hit your usage limit. On a hit it flips to Bedrock and records when the
-    limit window resets (parsed from the error when possible, otherwise a
-    5-hour fallback).
+    you hit your usage limit. On a **plan-limit** hit it flips to Bedrock and
+    records when the limit window resets (parsed from the error, else from the
+    captured usage data, else a 5-hour fallback). A **credit-cap** error
+    (Fable 5 / monthly spend cap) is logged and never acted on — the plan's
+    other models still work, so that's a `/model` problem, not a backend one.
   - in *bedrock* mode, flips back to subscription once that reset time passes.
     A *manual* switch to Bedrock (no auto-return time) is never flipped back.
   - in either mode, if something outside the tool changed the backend in
@@ -32,7 +40,10 @@ Three pieces:
     anything wrong with the adopted env is logged. The file sessions actually
     read always wins.
 - **Statusline** — shows `[SUB]` / `[BEDROCK]` for the current session, plus
-  what new sessions will use and the countdown to the auto-return.
+  what new sessions will use and the countdown to the auto-return. It also
+  captures the `rate_limits` data Claude Code pipes to it — the only place the
+  real usage numbers are exposed — into `~\.claude-autoswitch\usage.json` for
+  `status` and the monitor.
 
 Deliberately, we switch at 100% of the subscription rather than ~95%: there is
 no supported API that exposes your subscription usage percentage, and reacting
@@ -56,7 +67,8 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -AwsProfile my-sso-profil
 ```
 
 The installer is per-user (no admin), installs to and backs up `settings.json`
-into `~\.claude-autoswitch\`, and **does not change your current backend** — it
+into `~\.claude-autoswitch\`, puts the two switch shortcuts on your Desktop
+(`-NoShortcuts` to skip), and **does not change your current backend** — it
 adopts whatever you are on. To start subscription-first behavior:
 
 ```powershell
@@ -79,13 +91,15 @@ claude-switch check
 | `-IntervalMinutes <n>` | how often the monitor checks (default 5) |
 | `-NoStatusline` | don't add the statusline to `settings.json` |
 | `-NoTask` | don't register the monitor task (manual switching only) |
+| `-NoShortcuts` | don't create the two desktop shortcuts |
+| `-ShortcutDir <dir>` | put the shortcuts somewhere other than the Desktop |
 | `-NoPath` | leave the user PATH alone (unattended installs) |
 | `-TaskName <name>` | override the scheduled-task name |
 
 ## Commands
 
 ```text
-claude-switch status            current mode, timers, monitor state
+claude-switch status            mode, timers, subscription usage, monitor state
 claude-switch sub               use the Teams subscription (claude.ai login)
 claude-switch bedrock           use Bedrock until told otherwise
 claude-switch bedrock -Hours 5  use Bedrock, auto-return to sub in 5 hours
@@ -115,6 +129,11 @@ your plan offers.
 - **Detection is reactive.** After hitting the limit, the flip happens on the
   monitor's next run (≤5 min). Until then, requests in subscription mode fail
   with the limit message — retry after the flip.
+- **A Fable "spend limit" is not a subscription limit.** Fable 5 draws on org
+  usage credits, not your plan windows; when those cap, the other models still
+  work. The monitor logs it (`status` shows when one was last seen) and
+  deliberately does not switch — `/model opus` in the session is the fix. See
+  [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for the full story.
 - **Weekly caps.** If the reset time can't be parsed and you re-hit the limit
   right after an auto-return (typical of the weekly cap), the monitor backs
   off to a 24 h stay on Bedrock instead of 5 h. Check `claude-switch log` if
@@ -174,7 +193,9 @@ known failure modes and how to diagnose each one.
 3. `claude-switch sub`, then `claude-switch check` to prove the Bedrock side
    answers before it's ever needed.
 4. Day-to-day: nothing. Work on the subscription; when a limit hits, new
-   sessions ride Bedrock until the window resets.
+   sessions ride Bedrock until the window resets. For anyone who never opens
+   a terminal, the two desktop icons the installer creates are the whole
+   interface: click the backend you want, read the status, press Enter.
 
 ## Uninstall
 

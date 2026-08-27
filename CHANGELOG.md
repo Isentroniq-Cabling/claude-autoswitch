@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.2.0 — 2026-08-27
+
+### Fixed
+
+- **Credit-cap errors no longer switch backends — reverting a 1.1.3
+  misdiagnosis.** The "monthly spend limit" errors of 2026-08-24 were not the
+  subscription running out: they were **Fable 5 exhausting the org's usage
+  credits**, which that model draws instead of plan limits (the Claude Code
+  binary says it outright: *"Fable 5 is now using usage credits instead of
+  your plan limits"*, and one variant of the error even ends "Switch to
+  another model to continue"). The 5-hour and weekly plan windows were fine
+  the whole time. 1.1.3 made that wording a failover trigger, so a capped
+  Fable — a `/model opus` problem, free to fix — would have moved the whole
+  machine to paid Bedrock, daily. Detection now classifies limit errors
+  (`Get-LimitKind`): plan wordings switch as before; credit wordings
+  (`spend limit`, `usage credit`, `credit cap`) are logged, stamped into
+  state (`lastCreditCap`, shown by `status`), and deliberately not acted on.
+  If an org routes plan overage through credits, plan exhaustion still emits
+  the plan wordings first, so nothing is stranded.
+
+### Added
+
+- **The statusline now captures the real subscription usage numbers.** Claude
+  Code pipes `rate_limits` (five-hour and seven-day windows: used % + reset
+  time) to the statusline on every render — the only place those numbers are
+  exposed. `statusline.ps1` keeps the latest copy in
+  `~\.claude-autoswitch\usage.json` (atomic, written only on change);
+  `claude-switch status` displays it with its age; and when a limit error
+  carries no parseable reset time, the monitor takes the auto-return from the
+  exhausted window's real reset instead of guessing 5 hours. Passive data —
+  only as fresh as the last rendered statusline.
+- **Two desktop shortcuts: the deterministic manual switch.** `install.ps1`
+  now creates "Claude - Subscription" and "Claude - Bedrock" on the Desktop
+  (`-NoShortcuts` to skip, `-ShortcutDir` to redirect). Each opens a console,
+  performs the switch, shows the resulting status, and waits for Enter — two
+  explicit icons rather than a toggle, so what a click does never depends on
+  state. Backed by a new `-Pause` flag on `claude-switch`, which also holds
+  the window open on a refused switch. The uninstaller removes only shortcuts
+  whose target points into its own bin dir.
+
 ## 1.1.3 — 2026-08-24 (evening)
 
 1.1.2 shipped two wrong assumptions, and one evening of real use surfaced

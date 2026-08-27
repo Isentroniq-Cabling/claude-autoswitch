@@ -1,7 +1,9 @@
 # claude-autoswitch monitor - runs from Task Scheduler every few minutes.
 # subscription mode: scan newly-appended transcript lines for a usage-limit
-#                    error; on hit, flip to bedrock and remember when the
-#                    limit window resets.
+#                    error; on a PLAN-limit hit, flip to bedrock and remember
+#                    when the limit window resets. A CREDIT-cap hit (Fable 5 /
+#                    monthly spend cap) is logged and noted in state, never
+#                    acted on - the plan's other models still answer.
 # bedrock mode:      when the remembered reset time passes, flip back to
 #                    subscription. Manual bedrock (no resetAt) is left alone.
 # either mode:       if something else changed the backend in settings.json,
@@ -9,6 +11,15 @@
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'common.ps1')
+
+# Log excerpts with the machine-readable trigger broken up: the log is
+# routinely printed back into a Claude Code session, and an intact copy in a
+# transcript is exactly what caused the 2026-08-04 false positive. Belt and
+# braces alongside the structural check in Get-LimitErrorFromLine.
+function Get-SafeExcerpt([string]$Text) {
+  if ($Text.Length -gt 200) { $Text = $Text.Substring(0, 200) }
+  return ($Text -replace 'limit reached\|', ('limit-reach' + 'ed<pipe>'))
+}
 
 if (-not (Test-Path $ConfigPath)) { return }
 
@@ -81,6 +92,7 @@ try {
 
   $hit = $null
   $hitReset = $null
+  $creditCap = $null
   if (Test-Path $ProjectsDir) {
     $files = Get-ChildItem -Path $ProjectsDir -Recurse -Filter '*.jsonl' -File -ErrorAction SilentlyContinue |
       Where-Object { $_.LastWriteTime -gt $since }
@@ -105,6 +117,20 @@ try {
           # result or a plain message and is rejected.
           $errText = Get-LimitErrorFromLine $line
           if (-not $errText) { continue }
+
+          if ((Get-LimitKind $errText) -eq 'credits') {
+            # Usage credits ran out (Fable 5 / the org's monthly spend cap).
+            # Model-scoped: the plan's other models still answer, so this is
+            # noted, never acted on - flipping to Bedrock here is exactly the
+            # false positive v1.1.3 shipped. /model moves the session to a
+            # plan model for free; a real plan exhaustion still says the plan
+            # wordings and still switches.
+            if (-not $creditCap) {
+              $creditCap = $errText
+              Write-Log ('credit cap seen (usage credits, not a plan limit) - not switching: ' + (Get-SafeExcerpt $errText))
+            }
+            continue
+          }
 
           $reset = Get-ResetFromText $errText
           if ($errText -match 'limit reached\|\d{10,13}') {
@@ -139,36 +165,45 @@ try {
   }
   Set-Prop $state 'fileOffsets' $kept
   Set-Prop $state 'lastScan' ($now.ToString('o'))
+  if ($creditCap) { Set-Prop $state 'lastCreditCap' ($now.ToString('o')) }
   Save-State $state
 
   if ($hit) {
-    $excerpt = $hit
-    if ($excerpt.Length -gt 200) { $excerpt = $excerpt.Substring(0, 200) }
-    # Logged with the trigger broken up: the log is routinely printed back into
-    # a Claude Code session, and an intact copy in a transcript is exactly what
-    # caused the 2026-08-04 false positive. Belt and braces alongside the
-    # structural check in Get-LimitErrorFromLine.
-    $safeMarker = 'limit-reach' + 'ed<pipe>'
-    $excerpt = $excerpt -replace 'limit reached\|', $safeMarker
-    Write-Log ('limit detected in transcript: ' + $excerpt)
+    Write-Log ('limit detected in transcript: ' + (Get-SafeExcerpt $hit))
 
     if ($null -eq $hitReset) {
-      if ($hit -match 'spend limit') {
-        # A monthly spend cap (org-level or personal) resets on a billing day
-        # this tool cannot know. Retry the subscription daily: the cost of
-        # guessing wrong is one failed call a day that flips straight back here.
-        $hitReset = $now.AddHours(24)
-        Write-Log 'monthly spend limit - will retry subscription daily'
+      # The error itself carried no reset time, but the statusline feed may
+      # know it: Claude Code hands the statusline the real five_hour and
+      # seven_day windows (used % + reset time), and statusline.ps1 keeps the
+      # latest copy in usage.json. Passive data - only as fresh as the last
+      # render - but a reset time still in the future is a reset time.
+      $usage = Read-JsonFile $UsagePath
+      if ($usage) {
+        $seven = Get-Prop $usage 'seven_day'
+        if ($seven -and [double](Get-Prop $seven 'used_percentage' 0) -ge 99) {
+          $t = ConvertFrom-ResetStamp (Get-Prop $seven 'resets_at')
+          if ($t -and $t -gt $now) {
+            $hitReset = $t
+            Write-Log ('auto-return taken from the weekly window in usage.json: ' + $t.ToString('o'))
+          }
+        }
+        if ($null -eq $hitReset) {
+          $t = ConvertFrom-ResetStamp (Get-Prop (Get-Prop $usage 'five_hour') 'resets_at')
+          if ($t -and $t -gt $now) {
+            $hitReset = $t
+            Write-Log ('auto-return taken from the 5h window in usage.json: ' + $t.ToString('o'))
+          }
+        }
       }
-      else {
-        # No parseable reset time. Default to the 5h session window; if we only
-        # just flipped back and hit the wall again, assume a weekly cap instead.
-        $flipBackRaw = Get-Prop $state 'lastFlipBackAt'
-        $recentFlipBack = $false
-        if ($flipBackRaw) { $recentFlipBack = ($now - (ConvertFrom-IsoDate $flipBackRaw)).TotalMinutes -lt 30 }
-        if ($recentFlipBack) { $hitReset = $now.AddHours(24) } else { $hitReset = $now.AddHours(5) }
-        Write-Log ('no reset time parseable, assuming auto-return at ' + $hitReset.ToString('o'))
-      }
+    }
+    if ($null -eq $hitReset) {
+      # Still nothing. Default to the 5h session window; if we only just
+      # flipped back and hit the wall again, assume a weekly cap instead.
+      $flipBackRaw = Get-Prop $state 'lastFlipBackAt'
+      $recentFlipBack = $false
+      if ($flipBackRaw) { $recentFlipBack = ($now - (ConvertFrom-IsoDate $flipBackRaw)).TotalMinutes -lt 30 }
+      if ($recentFlipBack) { $hitReset = $now.AddHours(24) } else { $hitReset = $now.AddHours(5) }
+      Write-Log ('no reset time parseable, assuming auto-return at ' + $hitReset.ToString('o'))
     }
     Set-ClaudeBackend -Mode bedrock -ResetAt $hitReset -Reason 'auto: subscription limit reached'
   }

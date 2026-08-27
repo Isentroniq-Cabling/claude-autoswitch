@@ -11,6 +11,11 @@ param(
   [int]$IntervalMinutes = 5,
   [switch]$NoStatusline,
   [switch]$NoTask,
+  # Skip the two desktop shortcuts (unattended installs).
+  [switch]$NoShortcuts,
+  # Where the shortcuts go. Defaults to the user's Desktop; overridden by the
+  # test suite so a test run never touches the real one.
+  [string]$ShortcutDir,
   # Leave the user PATH untouched (unattended installs, and the test suite).
   [switch]$NoPath,
   # Overridden by the test suite so a test run can never touch the real task.
@@ -172,6 +177,37 @@ if (-not $NoTask) {
     -Settings $taskSettings -Description 'claude-autoswitch: flips Claude Code between subscription and Bedrock' `
     -Force | Out-Null
   Write-Host ('Scheduled task {0} registered (every {1} min).' -f $TaskName, $IntervalMinutes)
+}
+
+# --- desktop shortcuts --------------------------------------------------------
+# The deterministic manual switch, packaged for a double-click: two explicit
+# icons, one per destination, each opening a console that shows the result and
+# waits for Enter. Two icons rather than a toggle so what a click does never
+# depends on state. Automatic detection is best-effort by nature (it reads
+# unversioned error prose after the fact); these are the guarantee.
+if (-not $NoShortcuts) {
+  if (-not $ShortcutDir) { $ShortcutDir = [Environment]::GetFolderPath('Desktop') }
+  New-Item -ItemType Directory -Force -Path $ShortcutDir | Out-Null
+  $switchPs1 = Join-Path $BinDir 'claude-switch.ps1'
+  $wsh = New-Object -ComObject WScript.Shell
+  try {
+    # Icon indexes are cosmetic - any distinct pair works, and anyone can
+    # change them in the shortcut's properties.
+    foreach ($s in @(
+      @{ Name = 'Claude - Subscription.lnk'; Arg = 'sub';     Icon = 220 },
+      @{ Name = 'Claude - Bedrock.lnk';      Arg = 'bedrock'; Icon = 18 }
+    )) {
+      $lnk = $wsh.CreateShortcut((Join-Path $ShortcutDir $s.Name))
+      $lnk.TargetPath = (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
+      $lnk.Arguments = ('-NoProfile -ExecutionPolicy Bypass -File "{0}" {1} -Pause' -f $switchPs1, $s.Arg)
+      $lnk.WorkingDirectory = $BinDir
+      $lnk.IconLocation = ((Join-Path $env:SystemRoot 'System32\shell32.dll') + ',' + $s.Icon)
+      $lnk.Description = ('claude-autoswitch: route new Claude Code sessions to ' + $s.Arg)
+      $lnk.Save()
+    }
+  }
+  finally { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($wsh) }
+  Write-Host ('Desktop shortcuts created: "Claude - Subscription" and "Claude - Bedrock" in ' + $ShortcutDir)
 }
 
 # --- PATH --------------------------------------------------------------------

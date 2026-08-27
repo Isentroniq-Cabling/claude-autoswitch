@@ -5,6 +5,9 @@ param(
   [switch]$PurgeData,
   # Leave the user PATH untouched (unattended removal, and the test suite).
   [switch]$NoPath,
+  # Where install.ps1 put the desktop shortcuts. Defaults to the user's
+  # Desktop; overridden by the test suite.
+  [string]$ShortcutDir,
   # Overridden by the test suite so a test run can never touch the real task.
   [string]$TaskName = 'ClaudeAutoswitch'
 )
@@ -31,6 +34,26 @@ if (Test-Path $SettingsPath) {
     [System.IO.File]::WriteAllText($SettingsPath, ($settings | ConvertTo-Json -Depth 32), $enc)
     Write-Host 'Statusline removed from settings.json.'
   }
+}
+
+# Remove our desktop shortcuts - only if they are ours, judged the same way
+# as the statusline above: the shortcut's arguments must point into our bin
+# dir. A same-named shortcut someone made themselves is left alone.
+if (-not $ShortcutDir) { $ShortcutDir = [Environment]::GetFolderPath('Desktop') }
+foreach ($name in @('Claude - Subscription.lnk', 'Claude - Bedrock.lnk')) {
+  $p = Join-Path $ShortcutDir $name
+  if (-not (Test-Path $p)) { continue }
+  try {
+    $wsh = New-Object -ComObject WScript.Shell
+    try {
+      $lnkArgs = [string]$wsh.CreateShortcut($p).Arguments
+      if ($lnkArgs -like ('*' + $BinDir + '*') -or $lnkArgs -like ('*' + $LegacyBinDir + '*')) {
+        Remove-Item $p -Force
+        Write-Host ('Shortcut removed: ' + $name)
+      }
+    }
+    finally { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($wsh) }
+  } catch {}
 }
 
 # Remove PATH entry.
